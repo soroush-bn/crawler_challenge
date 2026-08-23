@@ -1,26 +1,27 @@
 import os
+import queue
 from playwright.sync_api import sync_playwright
-from consts import BASE_URL, USERNAME, PASSWORD
+from consts import BASE_URL, USERNAME, PASSWORD, PAGE_LIMIT
+from tree import Tree, TreeNode
 
 class Crawler:
     def __init__(self):
         self.base_url = BASE_URL
         self.username = USERNAME
         self.password = PASSWORD
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-
-    def login(self):
-        self.playwright = sync_playwright().start()
-        print(f"Logging in to {self.base_url} with username: {self.username}")
+        self.playwright =  sync_playwright().start()
         self.browser = self.playwright.chromium.launch(headless=False)
         self.context = self.browser.new_context(
             http_credentials={"username": self.username, "password": self.password}
         )
         self.page = self.context.new_page()
-        self.page.goto(self.base_url, wait_until="networkidle")
+        self.tree = Tree(self.base_url)
+
+    def login(self):
+        # self.playwright =
+        print(f"Logging in to {self.base_url} with username: {self.username}")
+
+        self.page.goto(self.base_url, wait_until="domcontentloaded")
         print(self.page.title())
 
     def close(self):
@@ -29,14 +30,14 @@ class Crawler:
         if self.playwright:
             self.playwright.stop()
 
-    def get_all_links(self, page):
-        return page.eval_on_selector_all(
+    def get_all_links(self):
+        return self.page.eval_on_selector_all(
             "a[href], area[href]",
             "els => els.map(e => e.href)"
         )
 
-    def get_all_resource_urls(self, page):
-        return page.evaluate("""
+    def get_all_resource_urls(self):
+        return self.page.evaluate("""
             () => {
                 const urls = new Set();
 
@@ -61,8 +62,8 @@ class Crawler:
             }
         """)
 
-    def get_css_urls(self, page):
-        return page.evaluate("""
+    def get_css_urls(self):
+        return self.page.evaluate("""
             () => {
                 const urls = new Set();
                 for (const sheet of document.styleSheets) {
@@ -80,24 +81,54 @@ class Crawler:
             }
         """)
 
-    def get_all_reachable_urls(self, page, url):
-        requested = []
-        page.on("request", lambda req: requested.append(req.url))
+    def get_all_reachable_urls(self):
+        dom_urls = set(self.get_all_resource_urls())
+        css_urls = set(self.get_css_urls())
+        return dom_urls | css_urls
 
-        page.goto(url, wait_until="networkidle")
+    def crawl(self):
+        queue = [(self.base_url, None)]
+        paginated_pages_fetched = 0
 
-        dom_urls = set(self.get_all_resource_urls(page))
-        css_urls = set(self.get_css_urls(page))
-        network_urls = set(requested)
+        network_urls = set()
+        self.page.on("request", lambda req: network_urls.add(req.url))
 
-        return dom_urls | css_urls | network_urls
+        while queue:
+            url, parent_node = queue.pop(0)
+            
+            is_paginated = "page=" in url
+            if is_paginated and paginated_pages_fetched >= PAGE_LIMIT:
+                print(f"Skipping paginated URL {url} - limit of {PAGE_LIMIT} reached.")
+                continue
+
+            network_urls.clear() 
+
+            if self.tree.dedup_mode == "url_only" and self.tree.is_url_visited(url):
+                if parent_node:
+                    self.tree.add_reference_node(url, parent_node)
+                continue
+
+            try:
+                self.page.goto(url, wait_until="domcontentloaded")
+                content = self.page.content()
+                if is_paginated:
+                    paginated_pages_fetched += 1
+            except Exception as e:
+                print(f"Failed to fetch {url}: {e}")
+                continue
+
+            node = self.tree.add_node_with_content(url, content, parent_node)
+            
+            if node is None:
+                continue
+
+            discovered_urls = self.get_all_reachable_urls() | network_urls
+            for discovered_url in discovered_urls:
+                queue.append((discovered_url, node))
 
 
 if __name__ == "__main__":
     crawler = Crawler()
     crawler.login()
-    urls = crawler.get_all_reachable_urls(crawler.page, BASE_URL)
-    print(f"Found {len(urls)} reachable URLs:")
-    for url in urls:
-        print(url)
-    crawler.close()
+    crawler.crawl()
+    crawler.tree.bfs_traversal()
