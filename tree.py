@@ -45,22 +45,26 @@ class TreeNode:
         return os.path.exists(file_path)
 
     def save(self, resource, findings):
-        if self.is_reference or self.is_saved():
+        if self.is_reference:
             return
-            
-        self.saver.save_resource_data(resource)
+
+        # Save resource data and binary only on first visit
+        if not self.is_saved():
+            self.saver.save_resource_data(resource)
+
+            if resource.body_bytes:
+                filename = self.url.split("/")[-1]
+                if not filename or "?" in filename or "=" in filename:
+                    import mimetypes
+                    # Guess extension from content_type (e.g. image/jpeg -> .jpg)
+                    content_type = resource.content_type.split(';')[0]
+                    ext = mimetypes.guess_extension(content_type) or ".bin"
+                    filename = f"downloaded_file{ext}"
+
+                self.saver.save_binary(resource.body_bytes, filename)
+
+        # Always (re-)save findings so metadata extraction results are persisted
         self.saver.save_findings(findings)
-        
-        if resource.body_bytes:
-            filename = self.url.split("/")[-1]
-            if not filename or "?" in filename or "=" in filename:
-                import mimetypes
-                # Guess extension from content_type (e.g. image/jpeg -> .jpg)
-                content_type = resource.content_type.split(';')[0]
-                ext = mimetypes.guess_extension(content_type) or ".bin"
-                filename = f"downloaded_file{ext}"
-                
-            self.saver.save_binary(resource.body_bytes, filename)
 
 
 class Tree:

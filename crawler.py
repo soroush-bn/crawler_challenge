@@ -204,12 +204,14 @@ class Crawler:
 
             all_findings = []
 
-            node.save(resource, all_findings)
             for ext in self.extractors:
                 try:
                     all_findings.extend(ext.extract(resource))
                 except Exception as e:
                     print(f"Extractor {ext.__class__.__name__} failed on {url}: {e}")
+
+            # Save resource + findings (after extraction so metadata findings are included)
+            node.save(resource, all_findings)
 
             # Run Finder
             found_password = None
@@ -219,6 +221,13 @@ class Crawler:
             if found:
                 found_password = found
                 location_found = "HTML Content"
+
+            # Search raw image/binary bytes for password pattern
+            if not found_password and resource.body_bytes:
+                found = self.finder.find_password_in_blob(resource.body_bytes)
+                if found:
+                    found_password = found
+                    location_found = "Binary Body Bytes"
 
             if not found_password:
                 for f in all_findings:

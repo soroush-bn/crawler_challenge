@@ -34,7 +34,11 @@ class Finder():
         return self._search_text(text_content)
 
     def find_password_in_image(self, image_bytes: bytes) -> Optional[str]:
-        pass
+        if not image_bytes:
+            return None
+        # Search raw bytes decoded as ASCII (covers EXIF, PNG tEXt, JPEG COM, etc.)
+        text = image_bytes.decode('ascii', errors='ignore')
+        return self._search_text(text)
 
     def find_password_in_pdf(self, pdf_bytes: bytes) -> Optional[str]:
         pass
