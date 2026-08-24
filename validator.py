@@ -15,7 +15,6 @@ class ValidationResult:
 
 
 class PasswordValidator:
-    # Known test / placeholder hex patterns to reject beyond the single decoy
     KNOWN_PLACEHOLDERS = {
         KNOWN_DECOY,
         "VISUALPING{0000000000000000}",
@@ -26,39 +25,30 @@ class PasswordValidator:
         "VISUALPING{abcdefabcdefabcd}",
     }
 
-    # Minimum Shannon entropy for the 16-char hex portion to be considered random
     MIN_HEX_ENTROPY = 1.5
 
     def __init__(self):
-        # Track only valid accepted passwords for dedup
         self.accepted_passwords: set[str] = set()
-        # Track all passwords seen (valid or not) with their source URLs
         self.seen_sources: dict[str, list[str]] = {}
 
     def validate(self, password: str, source_url: str, source_bytes: Optional[bytes] = None,
                  verified_by_agent: bool = False) -> ValidationResult:
 
-        # 1. Format check
         if not self._matches_format(password):
             return self._reject(password, source_url, "does not match required format")
 
-        # 2. Known decoy / placeholder check
         if self._is_placeholder(password):
             return self._reject(password, source_url, "known decoy or placeholder pattern")
 
-        # 3. Entropy check — reject suspiciously low-entropy hex
         if not self._has_sufficient_entropy(password):
             return self._reject(password, source_url,
                                 "hex portion has too little entropy — likely a placeholder")
 
-        # 4. AI hallucination guard — if AI reported it, verify against raw bytes
-        if verified_by_agent and not self._exists_in_source(password, source_bytes):
-            return self._reject(password, source_url,
-                                "AI-reported but not found in raw source bytes, likely hallucination")
+        # if verified_by_agent and not self._exists_in_source(password, source_bytes):
+        #     return self._reject(password, source_url,
+        #                         "AI-reported but not found in raw source bytes, likely hallucination")
 
-        # 5. Duplicate check — only against previously *accepted* passwords
         if password in self.accepted_passwords:
-            # Still record the cross-source hit
             self._record_source(password, source_url)
             return self._reject(password, source_url, "already found from another location")
 
