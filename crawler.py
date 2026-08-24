@@ -7,6 +7,7 @@ from tree import Tree, TreeNode
 from models import ResourceData
 from extractors import UrlExtractor, ProtocolExtractor, HtmlExtractor, JsContextExtractor, MediaExtractor, DecodingExtractor
 from finder import Finder
+from validator import PasswordValidator
 
 class Crawler:
     def __init__(self):
@@ -21,6 +22,7 @@ class Crawler:
         self.page = self.context.new_page()
         self.tree = Tree(self.base_url)
         self.finder = Finder(self.base_url)
+        self.validator = PasswordValidator()
         self.extractors = [
             UrlExtractor(),
             ProtocolExtractor(),
@@ -102,7 +104,7 @@ class Crawler:
     def crawl(self):
         queue = [(self.base_url, None)]
         paginated_pages_fetched = 0
-        found_passwords = set()
+        password_count = 0
 
         network_urls = set()
         self.page.on("request", lambda req: network_urls.add(req.url))
@@ -213,51 +215,69 @@ class Crawler:
             # Save resource + findings (after extraction so metadata findings are included)
             node.save(resource, all_findings)
 
-            # Run Finder
-            found_password = None
-            location_found = ""
+            # Run Finder — collect ALL candidate passwords from every source
+            candidates = []
 
             found = self.finder.find_password_in_text(content)
             if found:
-                found_password = found
-                location_found = "HTML Content"
+                candidates.append((found, "HTML Content", False))
 
             # Search raw image/binary bytes for password pattern
-            if not found_password and resource.body_bytes:
+            if resource.body_bytes:
                 found = self.finder.find_password_in_blob(resource.body_bytes)
                 if found:
-                    found_password = found
-                    location_found = "Binary Body Bytes"
+                    candidates.append((found, "Binary Body Bytes", False))
 
-            if not found_password:
-                for f in all_findings:
-                    found = self.finder.find_password_in_text(str(f))
-                    if found:
-                        found_password = found
-                        location_found = f.location
-                        break
-
-            if not found_password:
-                found = self.finder.find_password_in_text(str(resource))
+            for f in all_findings:
+                found = self.finder.find_password_in_text(str(f))
                 if found:
-                    found_password = found
-                    location_found = "Resource Metadata"
+                    # Findings from AI image extraction are agent-verified
+                    is_ai = f.location == "Password Found in Image"
+                    candidates.append((found, f.location, is_ai))
 
-            if found_password and found_password not in found_passwords:
-                found_passwords.add(found_password)
-                print("\n" + "="*50)
-                print(f"SUCCESS! PASSWORD FOUND: {found_password}")
-                print(f"URL: {url}")
-                print(f"LOCATION: {location_found}")
-                print(f"DEPTH: {node.depth}")
-                print("="*50 + "\n")
-                with open("PASSWORD_FOUND.txt", "a", encoding="utf-8") as f:
-                    f.write(f"Password: {found_password}\nURL: {url}\nLocation: {location_found}\nDepth: {node.depth}\n---\n")
+            found = self.finder.find_password_in_text(str(resource))
+            if found and not any(c[0] == found for c in candidates):
+                candidates.append((found, "Resource Metadata", False))
+
+            # Validate each candidate through the validator
+            for password, location, is_ai in candidates:
+                result = self.validator.validate(
+                    password=password,
+                    source_url=url,
+                    source_bytes=resource.body_bytes if is_ai else None,
+                    verified_by_agent=is_ai,
+                )
+
+                if result.is_valid:
+                    password_count += 1
+                    resource_dir = os.path.abspath(node.folder_path)
+                    print("\n" + "="*50)
+                    print(f"#{password_count} VALIDATED PASSWORD: {result.password}")
+                    print(f"   Confidence: {result.confidence}")
+                    print(f"   URL: {url}")
+                    print(f"   Location: {location}")
+                    print(f"   Resource Dir: {resource_dir}")
+                    print(f"   Depth: {node.depth}")
+                    print("="*50 + "\n")
+                    with open("PASSWORD_FOUND.txt", "a", encoding="utf-8") as f:
+                        f.write(f"#{password_count}\nPassword: {result.password}\nConfidence: {result.confidence}\n"
+                                f"URL: {url}\nLocation: {location}\nResource Dir: {resource_dir}\n"
+                                f"Depth: {node.depth}\n---\n")
+                else:
+                    print(f"  Rejected '{password}' from {location}: {result.reason}")
 
             discovered_urls = self.get_all_reachable_urls() | network_urls
             for discovered_url in discovered_urls:
                 queue.append((discovered_url, node))
 
+        # Print validation summary after crawl completes
+        summary = self.validator.summary()
+        print("\n" + "="*50)
+        print(f"CRAWL COMPLETE — {summary['accepted_count']} validated password(s)")
+        for i, pw in enumerate(summary['accepted_passwords'], 1):
+            sources = summary['source_map'].get(pw, [])
+            print(f"  #{i} {pw}  (found in {len(sources)} location(s))")
+        print("="*50 + "\n")
 
 if __name__ == "__main__":
     crawler = Crawler()
