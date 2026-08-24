@@ -41,10 +41,39 @@ class Finder():
         return self._search_text(text)
 
     def find_password_in_pdf(self, pdf_bytes: bytes) -> Optional[str]:
-        pass
+        if not pdf_bytes:
+            return None
+        try:
+            import pypdf
+            import io
+            reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            for page in reader.pages:
+                text = page.extract_text()
+                found = self._search_text(text)
+                if found:
+                    return found
+        except Exception as e:
+            pass
+        return None
 
     def find_password_in_blob(self, blob_bytes: bytes) -> Optional[str]:
         if not blob_bytes:
             return None
+            
+        # Check if it's a ZIP file (starts with PK\x03\x04)
+        if blob_bytes[:4] == b'PK\x03\x04':
+            try:
+                import zipfile
+                import io
+                with zipfile.ZipFile(io.BytesIO(blob_bytes)) as z:
+                    for filename in z.namelist():
+                        with z.open(filename) as f:
+                            content = f.read().decode('utf-8', errors='ignore')
+                            found = self._search_text(content)
+                            if found:
+                                return found
+            except Exception:
+                pass
+                
         # Attempt naive ASCII decode for uncompressed text in binary blobs
         return self._search_text(blob_bytes.decode('ascii', errors='ignore'))
