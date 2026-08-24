@@ -9,6 +9,7 @@ class TreeNode:
         self.url = url
         self.name = self._encode_url(url)
         self.parent = parent
+        self.depth = parent.depth + 1 if parent else 0
         self.children = []
         self.data = None
         self.content_hash = None
@@ -52,9 +53,13 @@ class TreeNode:
         
         if resource.body_bytes:
             filename = self.url.split("/")[-1]
-            # Provide a fallback name if the URL ends in a slash or is just a domain
             if not filename or "?" in filename or "=" in filename:
-                filename = "blob.bin" 
+                import mimetypes
+                # Guess extension from content_type (e.g. image/jpeg -> .jpg)
+                content_type = resource.content_type.split(';')[0]
+                ext = mimetypes.guess_extension(content_type) or ".bin"
+                filename = f"downloaded_file{ext}"
+                
             self.saver.save_binary(resource.body_bytes, filename)
 
 

@@ -2,10 +2,11 @@ from abc import ABC, abstractmethod
 from typing import List
 from urllib.parse import urlparse, parse_qsl
 import base64
+import os
 from html.parser import HTMLParser
 from models import ResourceData, Finding, Category
 from typing import Optional
-
+from genai.agy_cli import password_in_image
 class BaseExtractor(ABC):
     @abstractmethod
     def extract(self, resource: ResourceData) -> List[Finding]:
@@ -209,16 +210,43 @@ class JsContextExtractor(BaseExtractor):
 import re
 
 class MediaExtractor(BaseExtractor):
+    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff'}
+    DATA_DIR = os.path.join(".", "data")
+
     def extract(self, resource: ResourceData) -> List[Finding]:
         findings = []
         if not resource.body_bytes:
             return findings
-            
+
+        is_image = self._is_image(resource)
         content_type = resource.content_type.lower()
-        if content_type.startswith("image/"):
+
+        if is_image:
             findings.extend(self._extract_image(resource))
+            findings.extend(self._agi_image_extract(resource))
         elif "javascript" in content_type or "css" in content_type:
             findings.extend(self._extract_code(resource))
+        return findings
+
+    def _is_image(self, resource: ResourceData) -> bool:
+        if resource.content_type.lower().startswith("image/"):
+            return True
+        url_path = resource.url.split("?")[0]
+        ext = os.path.splitext(url_path)[1].lower()
+        return ext in self.IMAGE_EXTENSIONS
+
+    def _agi_image_extract(self, resource: ResourceData) -> List[Finding]:
+        findings = []
+        filename = resource.url.split("/")[-1].split("?")[0]
+        if not filename:
+            return findings
+        
+        for root, dirs, files in os.walk(self.DATA_DIR):
+            if filename in files:
+                result = password_in_image(root, filename)
+                if result:
+                    findings.append(Finding(resource.url, Category.LINKED_RESOURCES, "Password Found in Image", result))
+                break
         return findings
 
     def _extract_image(self, resource: ResourceData) -> List[Finding]:

@@ -6,6 +6,7 @@ from consts import BASE_URL, USERNAME, PASSWORD, PAGE_LIMIT
 from tree import Tree, TreeNode
 from models import ResourceData
 from extractors import UrlExtractor, ProtocolExtractor, HtmlExtractor, JsContextExtractor, MediaExtractor, DecodingExtractor
+from finder import Finder
 
 class Crawler:
     def __init__(self):
@@ -19,6 +20,7 @@ class Crawler:
         )
         self.page = self.context.new_page()
         self.tree = Tree(self.base_url)
+        self.finder = Finder(self.base_url)
         self.extractors = [
             UrlExtractor(),
             ProtocolExtractor(),
@@ -100,6 +102,7 @@ class Crawler:
     def crawl(self):
         queue = [(self.base_url, None)]
         paginated_pages_fetched = 0
+        found_passwords = set()
 
         network_urls = set()
         self.page.on("request", lambda req: network_urls.add(req.url))
@@ -200,13 +203,47 @@ class Crawler:
             )
 
             all_findings = []
+
+            node.save(resource, all_findings)
             for ext in self.extractors:
                 try:
                     all_findings.extend(ext.extract(resource))
                 except Exception as e:
                     print(f"Extractor {ext.__class__.__name__} failed on {url}: {e}")
 
-            node.save(resource, all_findings)
+            # Run Finder
+            found_password = None
+            location_found = ""
+
+            found = self.finder.find_password_in_text(content)
+            if found:
+                found_password = found
+                location_found = "HTML Content"
+
+            if not found_password:
+                for f in all_findings:
+                    found = self.finder.find_password_in_text(str(f))
+                    if found:
+                        found_password = found
+                        location_found = f.location
+                        break
+
+            if not found_password:
+                found = self.finder.find_password_in_text(str(resource))
+                if found:
+                    found_password = found
+                    location_found = "Resource Metadata"
+
+            if found_password and found_password not in found_passwords:
+                found_passwords.add(found_password)
+                print("\n" + "="*50)
+                print(f"SUCCESS! PASSWORD FOUND: {found_password}")
+                print(f"URL: {url}")
+                print(f"LOCATION: {location_found}")
+                print(f"DEPTH: {node.depth}")
+                print("="*50 + "\n")
+                with open("PASSWORD_FOUND.txt", "a", encoding="utf-8") as f:
+                    f.write(f"Password: {found_password}\nURL: {url}\nLocation: {location_found}\nDepth: {node.depth}\n---\n")
 
             discovered_urls = self.get_all_reachable_urls() | network_urls
             for discovered_url in discovered_urls:
@@ -217,4 +254,4 @@ if __name__ == "__main__":
     crawler = Crawler()
     crawler.login()
     crawler.crawl()
-    crawler.tree.bfs_traversal()
+    # crawler.tree.bfs_traversal()
