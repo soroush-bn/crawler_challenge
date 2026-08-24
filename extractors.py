@@ -260,7 +260,7 @@ class DecodingExtractor(BaseExtractor):
                     findings.append(Finding(resource.url, Category.ENCODED_OBFUSCATED, f"{location} Base64", decoded))
         return findings
 
-    def _try_base64_decode(self, text: str) -> str | None:
+    def _try_base64_decode(self, text: str) -> Optional[str]:
         try:
             padded = text + '=' * (-len(text) % 4)
             decoded_bytes = base64.b64decode(padded, validate=True)
