@@ -1,4 +1,7 @@
+import os
 import hashlib
+from saving import Saving
+from consts import RESOURCE_DATA_FILENAME
 
 
 class TreeNode:
@@ -12,6 +15,15 @@ class TreeNode:
         self.fetch_count = 0
         self.is_reference = is_reference
 
+        if not self.is_reference:
+            self.folder_path = self._calculate_folder_path()
+            self.saver = Saving(self.folder_path)
+
+    def _calculate_folder_path(self):
+        if self.parent:
+            return os.path.join(self.parent.folder_path, self.name)
+        return os.path.join(".", "data", self.name)
+
     def add_child(self, child_node):
         self.children.append(child_node)
 
@@ -24,6 +36,26 @@ class TreeNode:
 
     def _encode_url(self, url):
         return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+    def is_saved(self) -> bool:
+        if self.is_reference:
+            return True
+        file_path = os.path.join(self.folder_path, RESOURCE_DATA_FILENAME)
+        return os.path.exists(file_path)
+
+    def save(self, resource, findings):
+        if self.is_reference or self.is_saved():
+            return
+            
+        self.saver.save_resource_data(resource)
+        self.saver.save_findings(findings)
+        
+        if resource.body_bytes:
+            filename = self.url.split("/")[-1]
+            # Provide a fallback name if the URL ends in a slash or is just a domain
+            if not filename or "?" in filename or "=" in filename:
+                filename = "blob.bin" 
+            self.saver.save_binary(resource.body_bytes, filename)
 
 
 class Tree:
