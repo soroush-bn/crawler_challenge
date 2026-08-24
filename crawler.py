@@ -8,9 +8,16 @@ from models import ResourceData
 from extractors import UrlExtractor, ProtocolExtractor, HtmlExtractor, JsContextExtractor, MediaExtractor, DecodingExtractor
 from finder import Finder
 from validator import PasswordValidator
+from urllib.parse import urlparse
+from collections import deque
 
 class Crawler:
-    def __init__(self):
+    def is_same_site(self, url: str) -> bool:
+        return urlparse(url).netloc in ("", urlparse(self.base_url).netloc)
+
+    def __init__(self, enable_interaction=False, enable_ai=False):
+        self.enable_interaction = enable_interaction
+        self.enable_ai = enable_ai
         self.base_url = BASE_URL
         self.username = USERNAME
         self.password = PASSWORD
@@ -28,7 +35,7 @@ class Crawler:
             ProtocolExtractor(),
             HtmlExtractor(),
             JsContextExtractor(),
-            MediaExtractor(),
+            MediaExtractor(enable_ai=self.enable_ai),
             DecodingExtractor()
         ]
 
@@ -36,7 +43,7 @@ class Crawler:
         # self.playwright =
         print(f"Logging in to {self.base_url} with username: {self.username}")
 
-        self.page.goto(self.base_url, wait_until="domcontentloaded")
+        self.page.goto(self.base_url, wait_until="networkidle")
         print(self.page.title())
 
     def close(self):
@@ -44,6 +51,53 @@ class Crawler:
             self.browser.close()
         if self.playwright:
             self.playwright.stop()
+
+    def simulate_user_interaction(self):
+        try:
+            self.page.evaluate("""
+                async () => {
+                    await new Promise((resolve) => {
+                        let totalHeight = 0;
+                        const distance = 250;
+                        let scrolls = 0;
+                        const timer = setInterval(() => {
+                            const scrollHeight = document.body.scrollHeight;
+                            window.scrollBy(0, distance);
+                            totalHeight += distance;
+                            scrolls++;
+                            
+                            // Stop if we hit the bottom or scrolled 20 times (max 2 seconds of scrolling)
+                            if(totalHeight >= scrollHeight || scrolls >= 20){
+                                clearInterval(timer);
+                                resolve();
+                            }
+                        }, 100);
+                    });
+                }
+            """)
+        except Exception as e:
+            pass
+
+        try:
+            # First hover links
+            for el in self.page.locator("a").all()[:15]:
+                try:
+                    el.hover(timeout=200, force=True)
+                except Exception:
+                    pass
+                    
+            # Then click buttons to open modals or trigger fetch requests
+            # Using evaluate to click prevents Playwright from hanging if navigation occurs
+            self.page.evaluate("""
+                document.querySelectorAll('button, [role="button"], [onclick], input[type="submit"], input[type="button"]').forEach(el => {
+                    try { el.click(); } catch(e) {}
+                });
+            """)
+        except Exception:
+            pass
+            
+        # Brief pause to allow network requests or UI changes triggered by clicks to process
+        self.page.wait_for_timeout(500)
 
     def get_all_links(self):
         return self.page.eval_on_selector_all(
@@ -102,7 +156,8 @@ class Crawler:
         return dom_urls | css_urls
 
     def crawl(self):
-        queue = [(self.base_url, None)]
+        queue = deque([(self.base_url, None)])
+        queued_urls = {self.base_url}
         paginated_pages_fetched = 0
         password_count = 0
 
@@ -113,19 +168,68 @@ class Crawler:
         self.page.on("console", lambda msg: console_logs.append(msg.text))
         
         websocket_msgs = []
-        self.page.on("websocket", lambda ws: ws.on("framereceived", lambda frame: websocket_msgs.append(frame.text)))
+        def handle_ws(ws):
+            ws.on("framereceived", lambda frame: websocket_msgs.append(str(frame.text) + " " + str(frame.payload)))
+        self.page.on("websocket", handle_ws)
         
         xhr_responses = []
         def handle_response(res):
             try:
-                if res.request.resource_type in ["fetch", "xhr"]:
-                    xhr_responses.append({"url": res.url, "body": res.text()})
+                body = ""
+                try:
+                    # Attempt to get body for text-based resources (skip images/media to avoid crashing text())
+                    if res.request.resource_type in ["fetch", "xhr", "document", "stylesheet", "script"]:
+                        body = res.text()
+                except Exception:
+                    pass
+                
+                header_str = "\\n".join([f"{k}: {v}" for k, v in res.all_headers().items()])
+                
+                # Extract TLS certificate details and custom HTTP Status Texts
+                sec = res.security_details
+                sec_str = ""
+                if sec:
+                    sec_str = f"Security: Issuer={sec.get('issuer')}, Subject={sec.get('subjectName')}"
+                    
+                status_text = res.status_text
+                
+                # Store all intercepted responses (including redirects) in xhr_responses so JsContextExtractor sees them
+                xhr_responses.append({
+                    "url": f"{res.status} {status_text} {res.request.resource_type} {res.url}",
+                    "body": f"Headers:\\n{header_str}\\n\\nSecurity:\\n{sec_str}\\n\\nBody:\\n{body}"
+                })
             except Exception:
                 pass
+                
         self.page.on("response", handle_response)
+        self.context.on("page", lambda new_page: new_page.on("response", handle_response))
+        
+        # Capture file downloads (e.g., Content-Disposition: attachment)
+        def handle_download(download):
+            try:
+                path = download.path()
+                if path:
+                    with open(path, 'rb') as f:
+                        blob_bytes = f.read()
+                        
+                        # Process binary with finder
+                        found = self.finder.find_password_in_pdf(blob_bytes)
+                        if not found:
+                            found = self.finder.find_password_in_blob(blob_bytes)
+                            
+                        if found:
+                            # Validate and log immediately since this bypasses the normal node loop
+                            res = self.validator.validate(password=found, source_url=download.url, verified_by_agent=False)
+                            if res.is_valid:
+                                with open("PASSWORD_FOUND.txt", "a", encoding="utf-8") as out_f:
+                                    out_f.write(f"\\n#DOWNLOAD_FOUND\\nPassword: {res.password}\\nURL: {download.url}\\nLocation: Downloaded File\\n---\\n")
+                                print(f"\\nFOUND PASSWORD IN DOWNLOAD: {res.password}")
+            except Exception:
+                pass
+        self.page.on("download", handle_download)
 
         while queue:
-            url, parent_node = queue.pop(0)
+            url, parent_node = queue.popleft()
             
             is_paginated = "page=" in url
             if is_paginated and paginated_pages_fetched >= PAGE_LIMIT:
@@ -144,6 +248,14 @@ class Crawler:
 
             try:
                 response = self.page.goto(url, wait_until="domcontentloaded")
+                
+                # Only simulate interactions (and suffer the 1.5s delay) if the page is actually HTML!
+                # If we goto an image or JSON file, waiting 1.5s for buttons to render is a huge waste of time.
+                content_type = response.headers.get("content-type", "").lower() if response else ""
+                if self.enable_interaction and "text/html" in content_type:
+                    print(f"Simulating user interactions (scrolling & hovering) on {url}...")
+                    self.simulate_user_interaction()
+                
                 content = self.page.content()
                 if is_paginated:
                     paginated_pages_fetched += 1
@@ -212,26 +324,62 @@ class Crawler:
                 except Exception as e:
                     print(f"Extractor {ext.__class__.__name__} failed on {url}: {e}")
 
-            # Save resource + findings (after extraction so metadata findings are included)
             node.save(resource, all_findings)
 
-            # Run Finder — collect ALL candidate passwords from every source
             candidates = []
-
             found = self.finder.find_password_in_text(content)
             if found:
                 candidates.append((found, "HTML Content", False))
 
-            # Search raw image/binary bytes for password pattern
             if resource.body_bytes:
+                if "application/pdf" in resource.content_type.lower():
+                    found = self.finder.find_password_in_pdf(resource.body_bytes)
+                    if found:
+                        candidates.append((found, "PDF Content", False))
+                        
+                if "application/json" in resource.content_type.lower() or "text/json" in resource.content_type.lower():
+                    try:
+                        import json
+                        json_data = json.loads(resource.body_bytes.decode('utf-8'))
+                        found = self.finder.find_password_in_json(json_data)
+                        if found and not any(c[0] == found for c in candidates):
+                            candidates.append((found, "JSON Content", False))
+                    except Exception:
+                        pass
+                        
                 found = self.finder.find_password_in_blob(resource.body_bytes)
-                if found:
+                if found and not any(c[0] == found for c in candidates):
                     candidates.append((found, "Binary Body Bytes", False))
+
+            import base64
+            import os
+            from genai.agy_cli import password_in_image
+            
+            for selector, data_url in resource.canvas_data.items():
+                if "," in data_url:
+                    try:
+                        header, b64_data = data_url.split(",", 1)
+                        canvas_bytes = base64.b64decode(b64_data)
+                        
+                        # Check binary for ASCII
+                        found = self.finder.find_password_in_blob(canvas_bytes)
+                        if found and not any(c[0] == found for c in candidates):
+                            candidates.append((found, f"Canvas Blob: {selector}", False))
+                            
+                        # Save and OCR with GenAI
+                        if self.enable_ai and node and not node.is_reference:
+                            canvas_filename = f"canvas_{hash(selector)}.png"
+                            with open(os.path.join(node.folder_path, canvas_filename), "wb") as cf:
+                                cf.write(canvas_bytes)
+                            found_ai = password_in_image(node.folder_path, canvas_filename)
+                            if found_ai and not any(c[0] == found_ai for c in candidates):
+                                candidates.append((found_ai, f"Canvas Image OCR: {selector}", True))
+                    except Exception:
+                        pass
 
             for f in all_findings:
                 found = self.finder.find_password_in_text(str(f))
                 if found:
-                    # Findings from AI image extraction are agent-verified
                     is_ai = f.location == "Password Found in Image"
                     candidates.append((found, f.location, is_ai))
 
@@ -239,7 +387,6 @@ class Crawler:
             if found and not any(c[0] == found for c in candidates):
                 candidates.append((found, "Resource Metadata", False))
 
-            # Validate each candidate through the validator
             for password, location, is_ai in candidates:
                 result = self.validator.validate(
                     password=password,
@@ -268,7 +415,19 @@ class Crawler:
 
             discovered_urls = self.get_all_reachable_urls() | network_urls
             for discovered_url in discovered_urls:
+                if not self.is_same_site(discovered_url):
+                    continue
+                    
+                if self.tree.dedup_mode == "url_only":
+                    if self.tree.is_url_visited(discovered_url):
+                        self.tree.add_reference_node(discovered_url, node)
+                        continue
+                    if discovered_url in queued_urls:
+                        # Already in queue waiting to be processed
+                        continue
+                        
                 queue.append((discovered_url, node))
+                queued_urls.add(discovered_url)
 
         # Print validation summary after crawl completes
         summary = self.validator.summary()
@@ -280,7 +439,13 @@ class Crawler:
         print("="*50 + "\n")
 
 if __name__ == "__main__":
-    crawler = Crawler()
+    import argparse
+    parser = argparse.ArgumentParser(description="Run the Visualping crawler.")
+    parser.add_argument("--interaction", action="store_true", help="Enable user interactions (scrolling, clicking).")
+    parser.add_argument("--ai", action="store_true", help="Enable GenAI for OCR on images and canvas data.")
+    args = parser.parse_args()
+
+    crawler = Crawler(enable_interaction=args.interaction, enable_ai=args.ai)
     crawler.login()
     crawler.crawl()
     # crawler.tree.bfs_traversal()

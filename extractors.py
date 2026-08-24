@@ -101,15 +101,13 @@ class ProtocolExtractor(BaseExtractor):
 
     def _extract_headers(self, resource: ResourceData) -> List[Finding]:
         findings = []
-        interesting_headers = ["x-", "server", "location"]
         for key, value in resource.headers.items():
-            if any(key.lower().startswith(p) for p in interesting_headers):
-                findings.append(Finding(
-                    source_url=resource.url,
-                    category=Category.SERVER_PROTOCOL,
-                    location=f"Header: {key}",
-                    content=value
-                ))
+            findings.append(Finding(
+                source_url=resource.url,
+                category=Category.SERVER_PROTOCOL,
+                location=f"Header: {key}",
+                content=value
+            ))
         return findings
 
     def _extract_cookies(self, resource: ResourceData) -> List[Finding]:
@@ -223,6 +221,9 @@ class MediaExtractor(BaseExtractor):
     IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff'}
     DATA_DIR = os.path.join(".", "data")
 
+    def __init__(self, enable_ai=False):
+        self.enable_ai = enable_ai
+
     def extract(self, resource: ResourceData) -> List[Finding]:
         findings = []
         if not resource.body_bytes:
@@ -247,6 +248,9 @@ class MediaExtractor(BaseExtractor):
 
     def _agi_image_extract(self, resource: ResourceData) -> List[Finding]:
         findings = []
+        if not self.enable_ai:
+            return findings
+            
         filename = resource.url.split("/")[-1].split("?")[0]
         if not filename:
             return findings
@@ -576,6 +580,21 @@ class DecodingExtractor(BaseExtractor):
             
         for cookie in resource.cookies:
             texts_to_scan.append((f"Cookie {cookie.get('name')}", cookie.get('value', '')))
+            
+        for k, v in resource.local_storage.items():
+            texts_to_scan.append((f"localStorage {k}", v))
+            
+        for k, v in resource.session_storage.items():
+            texts_to_scan.append((f"sessionStorage {k}", v))
+            
+        for idx, log in enumerate(resource.console_logs):
+            texts_to_scan.append((f"Console Log [{idx}]", log))
+            
+        for idx, msg in enumerate(resource.websocket_messages):
+            texts_to_scan.append((f"WebSocket Msg [{idx}]", msg))
+            
+        for idx, xhr in enumerate(resource.xhr_responses):
+            texts_to_scan.append((f"Intercepted Response [{idx}]", xhr.get('body', '')))
         
         # Look for Base64 sequences (at least 8 chars long)
         base64_regex = re.compile(r'(?:[A-Za-z0-9+/]{4}){2,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
