@@ -177,13 +177,11 @@ class Crawler:
             try:
                 body = ""
                 try:
-                    # Attempt to get body for text-based resources (skip images/media to avoid crashing text())
-                    if res.request.resource_type in ["fetch", "xhr", "document", "stylesheet", "script"]:
-                        body = res.text()
+                    body = res.text()
                 except Exception:
                     pass
                 
-                header_str = "\\n".join([f"{k}: {v}" for k, v in res.all_headers().items()])
+                header_str = "\n".join([f"{k}: {v}" for k, v in res.all_headers().items()])
                 
                 # Extract TLS certificate details and custom HTTP Status Texts
                 sec = res.security_details
@@ -196,7 +194,7 @@ class Crawler:
                 # Store all intercepted responses (including redirects) in xhr_responses so JsContextExtractor sees them
                 xhr_responses.append({
                     "url": f"{res.status} {status_text} {res.request.resource_type} {res.url}",
-                    "body": f"Headers:\\n{header_str}\\n\\nSecurity:\\n{sec_str}\\n\\nBody:\\n{body}"
+                    "body": f"Headers:\n{header_str}\n\nSecurity:\n{sec_str}\n\nBody:\n{body}"
                 })
             except Exception:
                 pass

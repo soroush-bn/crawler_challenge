@@ -3,6 +3,11 @@ from pathlib import Path
 
 import json
 
+DATA_DIR = r"E:\projects\visualping\data"
+# def offline_crawl(folder_path: str) -> str:
+#         prompt = (
+#     f"You have direct visual access to data files — you can open and see them without any tool, "
+#     )
 
 def password_in_image(folder_path: str, image_name: str) -> str:
     image_path = Path(folder_path) / image_name
@@ -28,19 +33,19 @@ def password_in_image(folder_path: str, image_name: str) -> str:
     f"where it appears in the image."
     )
     print(f"[AGY] Scanning image: {image_path.resolve()}")
-    MODEL="Gemini 3.1 Pro (High)"
+    MODEL="Gemini 3.7 Flash (High)"
     result = subprocess.run(
-        ["agy",  "--model", MODEL, "--add-dir", r"E:\projects\visualping\data", "-p", prompt],
+        ["agy",  "--model", MODEL, "--add-dir", DATA_DIR, "-p", prompt],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=30,
     )
 
     if result.returncode != 0:
         raise RuntimeError(f"agy failed: {result.stderr.strip()}")
 
     print(f"[AGY] Raw output: {result.stdout.strip()}")
-    
+
     try:
         return json.loads(result.stdout.strip())
     except json.JSONDecodeError:
