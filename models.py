@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 class Category(Enum):
     HTML_SOURCE = "HTML SOURCE"
@@ -29,12 +30,14 @@ class ResourceData:
     content_type: str = "text/html"
     body_bytes: bytes = b""
     text_content: str = ""
+    inner_text: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     redirect_chain: list[str] = field(default_factory=list)
     cookies: list[dict] = field(default_factory=list)
     local_storage: dict[str, str] = field(default_factory=dict)
     session_storage: dict[str, str] = field(default_factory=dict)
     console_logs: list[str] = field(default_factory=list)
-    xhr_responses: list[dict[str, str]] = field(default_factory=list)
+    xhr_responses: list[dict[str, any]] = field(default_factory=list)
     websocket_messages: list[str] = field(default_factory=list)
     canvas_data: dict[str, str] = field(default_factory=dict)
+    computed_styles: list[str] = field(default_factory=list)

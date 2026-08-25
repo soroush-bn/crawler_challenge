@@ -23,7 +23,9 @@ class Saving:
             "console_logs": resource.console_logs,
             "xhr_responses": resource.xhr_responses,
             "websocket_messages": resource.websocket_messages,
-            "canvas_data": resource.canvas_data
+            "canvas_data": resource.canvas_data,
+            "inner_text": getattr(resource, 'inner_text', ''),
+            "computed_styles": getattr(resource, 'computed_styles', [])
         }
         
         file_path = os.path.join(self.folder_path, RESOURCE_DATA_FILENAME)
