@@ -2,7 +2,7 @@ import os
 import hashlib
 from saving import Saving
 from consts import RESOURCE_DATA_FILENAME
-
+import mimetypes
 
 class TreeNode:
     def __init__(self, url, parent=None, is_reference=False):
@@ -55,7 +55,7 @@ class TreeNode:
             if resource.body_bytes:
                 filename = self.url.split("/")[-1]
                 if not filename or "?" in filename or "=" in filename:
-                    import mimetypes
+                    
                     # Guess extension from content_type (e.g. image/jpeg -> .jpg)
                     content_type = resource.content_type.split(';')[0]
                     ext = mimetypes.guess_extension(content_type) or ".bin"
