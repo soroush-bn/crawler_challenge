@@ -17,12 +17,12 @@ class ValidationResult:
 class PasswordValidator:
     KNOWN_PLACEHOLDERS = {
         KNOWN_DECOY,
-        "VISUALPING{0000000000000000}",
-        "VISUALPING{ffffffffffffffff}",
-        "VISUALPING{FFFFFFFFFFFFFFFF}",
-        "VISUALPING{1234567890abcdef}",
-        "VISUALPING{1234567890ABCDEF}",
-        "VISUALPING{abcdefabcdefabcd}",
+        # "VISUALPING{0000000000000000}",
+        # "VISUALPING{ffffffffffffffff}",
+        # "VISUALPING{FFFFFFFFFFFFFFFF}",
+        # "VISUALPING{1234567890abcdef}",
+        # "VISUALPING{1234567890ABCDEF}",
+        # "VISUALPING{abcdefabcdefabcd}",
     }
 
     MIN_HEX_ENTROPY = 1.5
@@ -40,9 +40,9 @@ class PasswordValidator:
         if self._is_placeholder(password):
             return self._reject(password, source_url, "known decoy or placeholder pattern")
 
-        if not self._has_sufficient_entropy(password):
-            return self._reject(password, source_url,
-                                "hex portion has too little entropy — likely a placeholder")
+        # if not self._has_sufficient_entropy(password):
+        #     return self._reject(password, source_url,
+        #                         "hex portion has too little entropy — likely a placeholder")
 
         # if verified_by_agent and not self._exists_in_source(password, source_bytes):
         #     return self._reject(password, source_url,
@@ -112,6 +112,8 @@ class PasswordValidator:
         return "low"
 
     def _reject(self, password: str, source_url: str, reason: str) -> ValidationResult:
+        if reason != "already found from another location":
+            print(f"[VALIDATOR] Rejected '{password}' from {source_url} - Reason: {reason}")
         # Do NOT add to accepted_passwords — only record the source for tracking
         self._record_source(password, source_url)
         return ValidationResult(password, False, reason, source_url, confidence="rejected")
