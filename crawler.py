@@ -10,6 +10,10 @@ from finder import Finder
 from validator import PasswordValidator
 from urllib.parse import urlparse
 from collections import deque
+import base64
+import os
+from genai.agy_cli import password_in_image
+from typing import Any
 
 class Crawler:
     def is_same_site(self, url: str) -> bool:
@@ -38,6 +42,10 @@ class Crawler:
             MediaExtractor(enable_ai=self.enable_ai),
             DecodingExtractor()
         ]
+        self._websocket_msgs: list[str] = []
+        self._network_urls: set[str] = set()
+        self._console_logs: list[str] = []
+        self._xhr_responses: list[dict[str, Any]] = []
 
     def login(self):
         # self.playwright =
@@ -86,13 +94,7 @@ class Crawler:
                 except Exception:
                     pass
                     
-            # Then click buttons to open modals or trigger fetch requests
-            # Using evaluate to click prevents Playwright from hanging if navigation occurs
-            self.page.evaluate("""
-                document.querySelectorAll('button, [role="button"], [onclick], input[type="submit"], input[type="button"]').forEach(el => {
-                    try { el.click(); } catch(e) {}
-                });
-            """)
+            # self._trigger_interactions()
         except Exception:
             pass
             
@@ -109,23 +111,45 @@ class Crawler:
         return self.page.evaluate("""
             () => {
                 const urls = new Set();
+                
+                function extractFromNode(root) {
+                    if (!root) return;
+                    
+                    root.querySelectorAll('[href]').forEach(el => urls.add(el.href));
+                    root.querySelectorAll('[src]').forEach(el => urls.add(el.src));
+                    root.querySelectorAll('[data]').forEach(el => urls.add(el.data));
+                    root.querySelectorAll('form[action]').forEach(el => urls.add(el.action));
 
-                document.querySelectorAll('[href]').forEach(el => urls.add(el.href));
-                document.querySelectorAll('[src]').forEach(el => urls.add(el.src));
-                document.querySelectorAll('[data]').forEach(el => urls.add(el.data));
-                document.querySelectorAll('form[action]').forEach(el => urls.add(el.action));
-
-                document.querySelectorAll('[srcset]').forEach(el => {
-                    el.srcset.split(',').forEach(part => {
-                        const url = part.trim().split(' ')[0];
-                        if (url) urls.add(new URL(url, document.baseURI).href);
+                    root.querySelectorAll('[srcset]').forEach(el => {
+                        el.srcset.split(',').forEach(part => {
+                            const url = part.trim().split(' ')[0];
+                            if (url) urls.add(new URL(url, document.baseURI).href);
+                        });
                     });
-                });
 
-                document.querySelectorAll('meta[http-equiv="refresh"]').forEach(el => {
-                    const match = el.content.match(/url=(.+)/i);
-                    if (match) urls.add(new URL(match[1], document.baseURI).href);
-                });
+                    root.querySelectorAll('meta[http-equiv="refresh"]').forEach(el => {
+                        const match = el.content.match(/url=(.+)/i);
+                        if (match) urls.add(new URL(match[1], document.baseURI).href);
+                    });
+                    
+                    // Recursively check Shadow DOMs
+                    root.querySelectorAll('*').forEach(el => {
+                        if (el.shadowRoot) extractFromNode(el.shadowRoot);
+                    });
+                }
+                
+                extractFromNode(document);
+                
+                // Extract from HTML comments
+                const iterator = document.createNodeIterator(document, NodeFilter.SHOW_COMMENT, null, false);
+                let curNode;
+                while (curNode = iterator.nextNode()) {
+                    const comment = curNode.nodeValue;
+                    const matches = comment.match(/(?:https?:\\/\\/|\\/)[a-zA-Z0-9\\-_/.]+/g);
+                    if (matches) {
+                        matches.forEach(m => urls.add(new URL(m, document.baseURI).href));
+                    }
+                }
 
                 return Array.from(urls);
             }
@@ -150,10 +174,212 @@ class Crawler:
             }
         """)
 
+    def _extract_computed_styles(self) -> list[str]:
+        """Extracts pseudo-elements and custom properties from the live DOM."""
+        try:
+            return self.page.evaluate("""
+                () => {
+                    const styles = [];
+                    const elements = document.querySelectorAll('*');
+                    for (let el of elements) {
+                        try {
+                            const before = window.getComputedStyle(el, '::before');
+                            const after = window.getComputedStyle(el, '::after');
+                            if (before && before.content && before.content !== 'none') {
+                                styles.push(el.tagName + '::before content: ' + before.content);
+                            }
+                            if (after && after.content && after.content !== 'none') {
+                                styles.push(el.tagName + '::after content: ' + after.content);
+                            }
+                            if (el.style && el.style.cssText) {
+                                styles.push(el.tagName + ' inline-style: ' + el.style.cssText);
+                            }
+                        } catch(e) {}
+                    }
+                    
+                    for (const sheet of document.styleSheets) {
+                        try {
+                            for (const rule of sheet.cssRules) {
+                                if (rule.style && rule.style.cssText) {
+                                    styles.push('CSSRule: ' + rule.cssText);
+                                }
+                            }
+                        } catch (e) { }
+                    }
+                    return styles;
+                }
+            """)
+        except Exception:
+            return []
+
+    def _extract_browser_storage(self) -> tuple[dict, dict]:
+        """Extracts localStorage, sessionStorage, and IndexedDB data."""
+        try:
+            local_storage = json.loads(self.page.evaluate("() => JSON.stringify(window.localStorage)"))
+            session_storage = json.loads(self.page.evaluate("() => JSON.stringify(window.sessionStorage)"))
+            
+            idb_dump = self.page.evaluate("""
+                async () => {
+                    try {
+                        const dump = {};
+                        if (!window.indexedDB || !window.indexedDB.databases) return "";
+                        const dbs = await window.indexedDB.databases();
+                        for (const dbInfo of dbs) {
+                            dump[dbInfo.name] = {};
+                            await new Promise((resolve) => {
+                                const req = window.indexedDB.open(dbInfo.name);
+                                req.onsuccess = (e) => {
+                                    const db = e.target.result;
+                                    const stores = Array.from(db.objectStoreNames);
+                                    let completed = 0;
+                                    if (stores.length === 0) return resolve();
+                                    stores.forEach(storeName => {
+                                        try {
+                                            const tx = db.transaction(storeName, 'readonly');
+                                            const store = tx.objectStore(storeName);
+                                            const getAll = store.getAll();
+                                            getAll.onsuccess = () => {
+                                                dump[dbInfo.name][storeName] = getAll.result;
+                                                completed++;
+                                                if (completed === stores.length) resolve();
+                                            };
+                                            getAll.onerror = () => { completed++; if (completed === stores.length) resolve(); };
+                                        } catch (err) { completed++; if (completed === stores.length) resolve(); }
+                                    });
+                                };
+                                req.onerror = resolve;
+                            });
+                        }
+                        return JSON.stringify(dump);
+                    } catch (e) { return ""; }
+                }
+            """)
+            if idb_dump:
+                local_storage["_INDEXED_DB_DUMP"] = str(idb_dump)
+            return local_storage, session_storage
+        except Exception:
+            return {}, {}
+
+    def _extract_canvas_data(self) -> dict[str, str]:
+        """Extracts Base64 payloads from all canvas elements."""
+        try:
+            return self.page.evaluate("""
+                () => {
+                    const data = {};
+                    document.querySelectorAll('canvas').forEach((c, i) => {
+                        try { data['canvas_' + i] = c.toDataURL(); } catch(e) {}
+                    });
+                    return data;
+                }
+            """)
+        except Exception:
+            return {}
+
+    def _trigger_interactions(self) -> None:
+        """Dispatches synthetic clicks to interactive elements without triggering navigations."""
+        try:
+            self.page.evaluate("""
+                () => {
+                    const selectors = 'button, [role="button"], [onclick], input[type="submit"], input[type="button"], summary, details, [tabindex], nav *, .btn, .card, .tab, .menu';
+                    const elements = document.querySelectorAll(selectors);
+                    
+                    elements.forEach(el => {
+                        try {
+                            const event = new MouseEvent('click', {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true
+                            });
+                            el.dispatchEvent(event);
+                        } catch(e) {}
+                    });
+                }
+            """)
+        except Exception:
+            pass
+
     def get_all_reachable_urls(self):
         dom_urls = set(self.get_all_resource_urls())
         css_urls = set(self.get_css_urls())
         return dom_urls | css_urls
+
+    def _handle_ws(self, ws) -> None:
+        """Listens for websocket frames and stores them for extraction."""
+        ws.on("framereceived", lambda frame: self._websocket_msgs.append(str(frame.text) + " " + str(frame.payload)))
+
+    def _handle_request(self, req) -> None:
+        self._network_urls.add(req.url)
+
+    def _handle_console(self, msg) -> None:
+        self._console_logs.append(msg.text)
+
+    def _handle_response(self, res) -> None:
+        try:
+            headers = res.all_headers()
+            
+            # Extract hidden URLs from headers
+            from urllib.parse import urljoin
+            import re
+            for k, v in headers.items():
+                k_lower = k.lower()
+                if k_lower == 'link':
+                    matches = re.findall(r'<([^>]+)>', v)
+                    for m in matches: self._network_urls.add(urljoin(res.url, m))
+                elif k_lower in ('location', 'refresh'):
+                    if k_lower == 'refresh':
+                        m = re.search(r'url=([^\s;]+)', v, re.IGNORECASE)
+                        if m: self._network_urls.add(urljoin(res.url, m.group(1)))
+                    else:
+                        self._network_urls.add(urljoin(res.url, v))
+
+            body_b64 = ""
+            try:
+                import base64
+                body = res.body()
+                body_b64 = base64.b64encode(body).decode('ascii')
+            except Exception:
+                pass
+            
+            header_str = "\n".join([f"{k}: {v}" for k, v in headers.items()])
+            
+            # Extract TLS certificate details and custom HTTP Status Texts
+            sec = res.security_details
+            sec_str = ""
+            if sec:
+                sec_str = f"Security: Issuer={sec.get('issuer')}, Subject={sec.get('subjectName')}"
+                
+            status_text = res.status_text
+            
+            # Store all intercepted responses (including redirects) in _xhr_responses so JsContextExtractor sees them
+            self._xhr_responses.append({
+                "url": f"{res.status} {status_text} {res.request.resource_type} {res.url}",
+                "body": f"Headers:\n{header_str}\n\nSecurity:\n{sec_str}\n\nBody (base64):\n{body_b64}",
+                "raw_body": body if 'body' in locals() else b""
+            })
+        except Exception:
+            pass
+
+    def _handle_download(self, download) -> None:
+        try:
+            path = download.path()
+            if path:
+                with open(path, 'rb') as f:
+                    blob_bytes = f.read()
+                    
+                    # Process binary with finder
+                    found_list = self.finder.find_password_in_pdf(blob_bytes)
+                    if not found_list:
+                        found_list = self.finder.find_password_in_blob(blob_bytes)
+                        
+                    for found in found_list:
+                        # Validate and log immediately since this bypasses the normal node loop
+                        res = self.validator.validate(password=found, source_url=download.url, verified_by_agent=False)
+                        if res.is_valid:
+                            with open("PASSWORD_FOUND.txt", "a", encoding="utf-8") as out_f:
+                                out_f.write(f"\n#DOWNLOAD_FOUND\nPassword: {res.password}\nURL: {download.url}\nLocation: Downloaded File\n---\n")
+                            print(f"\nFOUND PASSWORD IN DOWNLOAD: {res.password}")
+        except Exception:
+            pass
 
     def crawl(self):
         queue = deque([(self.base_url, None)])
@@ -161,70 +387,12 @@ class Crawler:
         paginated_pages_fetched = 0
         password_count = 0
 
-        network_urls = set()
-        self.page.on("request", lambda req: network_urls.add(req.url))
-        
-        console_logs = []
-        self.page.on("console", lambda msg: console_logs.append(msg.text))
-        
-        websocket_msgs = []
-        def handle_ws(ws):
-            ws.on("framereceived", lambda frame: websocket_msgs.append(str(frame.text) + " " + str(frame.payload)))
-        self.page.on("websocket", handle_ws)
-        
-        xhr_responses = []
-        def handle_response(res):
-            try:
-                body = ""
-                try:
-                    body = res.text()
-                except Exception:
-                    pass
-                
-                header_str = "\n".join([f"{k}: {v}" for k, v in res.all_headers().items()])
-                
-                # Extract TLS certificate details and custom HTTP Status Texts
-                sec = res.security_details
-                sec_str = ""
-                if sec:
-                    sec_str = f"Security: Issuer={sec.get('issuer')}, Subject={sec.get('subjectName')}"
-                    
-                status_text = res.status_text
-                
-                # Store all intercepted responses (including redirects) in xhr_responses so JsContextExtractor sees them
-                xhr_responses.append({
-                    "url": f"{res.status} {status_text} {res.request.resource_type} {res.url}",
-                    "body": f"Headers:\n{header_str}\n\nSecurity:\n{sec_str}\n\nBody:\n{body}"
-                })
-            except Exception:
-                pass
-                
-        self.page.on("response", handle_response)
-        self.context.on("page", lambda new_page: new_page.on("response", handle_response))
-        
-        # Capture file downloads (e.g., Content-Disposition: attachment)
-        def handle_download(download):
-            try:
-                path = download.path()
-                if path:
-                    with open(path, 'rb') as f:
-                        blob_bytes = f.read()
-                        
-                        # Process binary with finder
-                        found = self.finder.find_password_in_pdf(blob_bytes)
-                        if not found:
-                            found = self.finder.find_password_in_blob(blob_bytes)
-                            
-                        if found:
-                            # Validate and log immediately since this bypasses the normal node loop
-                            res = self.validator.validate(password=found, source_url=download.url, verified_by_agent=False)
-                            if res.is_valid:
-                                with open("PASSWORD_FOUND.txt", "a", encoding="utf-8") as out_f:
-                                    out_f.write(f"\\n#DOWNLOAD_FOUND\\nPassword: {res.password}\\nURL: {download.url}\\nLocation: Downloaded File\\n---\\n")
-                                print(f"\\nFOUND PASSWORD IN DOWNLOAD: {res.password}")
-            except Exception:
-                pass
-        self.page.on("download", handle_download)
+        self.page.on("request", self._handle_request)
+        self.page.on("console", self._handle_console)
+        self.page.on("websocket", self._handle_ws)
+        self.page.on("response", self._handle_response)
+        self.context.on("page", lambda new_page: new_page.on("response", self._handle_response))
+        self.page.on("download", self._handle_download)
 
         while queue:
             url, parent_node = queue.popleft()
@@ -234,10 +402,10 @@ class Crawler:
                 print(f"Skipping paginated URL {url} - limit of {PAGE_LIMIT} reached.")
                 continue
 
-            network_urls.clear() 
-            console_logs.clear()
-            websocket_msgs.clear()
-            xhr_responses.clear()
+            self._network_urls.clear() 
+            self._console_logs.clear()
+            self._websocket_msgs.clear()
+            self._xhr_responses.clear()
 
             if self.tree.dedup_mode == "url_only" and self.tree.is_url_visited(url):
                 if parent_node:
@@ -245,16 +413,16 @@ class Crawler:
                 continue
 
             try:
-                response = self.page.goto(url, wait_until="domcontentloaded")
-                
-                # Only simulate interactions (and suffer the 1.5s delay) if the page is actually HTML!
-                # If we goto an image or JSON file, waiting 1.5s for buttons to render is a huge waste of time.
+                response = self.page.goto(url, wait_until="networkidle")
                 content_type = response.headers.get("content-type", "").lower() if response else ""
                 if self.enable_interaction and "text/html" in content_type:
-                    print(f"Simulating user interactions (scrolling & hovering) on {url}...")
                     self.simulate_user_interaction()
                 
                 content = self.page.content()
+                try:
+                    inner_text = self.page.evaluate("() => document.body ? document.body.innerText : ''")
+                except Exception:
+                    inner_text = ""
                 if is_paginated:
                     paginated_pages_fetched += 1
             except Exception as e:
@@ -276,20 +444,10 @@ class Crawler:
                 
             cookies = self.context.cookies()
             
-            try:
-                local_storage = json.loads(self.page.evaluate("() => JSON.stringify(window.localStorage)"))
-                session_storage = json.loads(self.page.evaluate("() => JSON.stringify(window.sessionStorage)"))
-                canvas_data = self.page.evaluate("""
-                    () => {
-                        const data = {};
-                        document.querySelectorAll('canvas').forEach((c, i) => {
-                            try { data['canvas_' + i] = c.toDataURL(); } catch(e) {}
-                        });
-                        return data;
-                    }
-                """)
-            except Exception:
-                local_storage, session_storage, canvas_data = {}, {}, {}
+            local_storage, session_storage = self._extract_browser_storage()
+            canvas_data = self._extract_canvas_data()
+
+            computed_styles = self._extract_computed_styles()
 
             redirect_chain = []
             req = response.request if response else None
@@ -303,15 +461,17 @@ class Crawler:
                 content_type=headers.get("content-type", "text/html"),
                 body_bytes=body_bytes,
                 text_content=content,
+                inner_text=inner_text,
                 headers=headers,
                 redirect_chain=redirect_chain,
                 cookies=cookies,
                 local_storage=local_storage,
                 session_storage=session_storage,
-                console_logs=list(console_logs),
-                websocket_messages=list(websocket_msgs),
-                xhr_responses=list(xhr_responses),
-                canvas_data=canvas_data
+                console_logs=list(self._console_logs),
+                websocket_messages=list(self._websocket_msgs),
+                xhr_responses=list(self._xhr_responses),
+                canvas_data=canvas_data,
+                computed_styles=computed_styles
             )
 
             all_findings = []
@@ -325,33 +485,46 @@ class Crawler:
             node.save(resource, all_findings)
 
             candidates = []
-            found = self.finder.find_password_in_text(content)
-            if found:
+            found_list = self.finder.find_password_in_text(content)
+            for found in found_list:
                 candidates.append((found, "HTML Content", False))
+                
+            if inner_text:
+                found_list = self.finder.find_password_in_text(inner_text)
+                for found in found_list:
+                    if not any(c[0] == found for c in candidates):
+                        candidates.append((found, "Rendered Text", False))
 
             if resource.body_bytes:
                 if "application/pdf" in resource.content_type.lower():
-                    found = self.finder.find_password_in_pdf(resource.body_bytes)
-                    if found:
+                    found_list = self.finder.find_password_in_pdf(resource.body_bytes)
+                    for found in found_list:
                         candidates.append((found, "PDF Content", False))
                         
                 if "application/json" in resource.content_type.lower() or "text/json" in resource.content_type.lower():
                     try:
                         import json
                         json_data = json.loads(resource.body_bytes.decode('utf-8'))
-                        found = self.finder.find_password_in_json(json_data)
-                        if found and not any(c[0] == found for c in candidates):
-                            candidates.append((found, "JSON Content", False))
+                        found_list = self.finder.find_password_in_json(json_data)
+                        for found in found_list:
+                            if not any(c[0] == found for c in candidates):
+                                candidates.append((found, "JSON Content", False))
                     except Exception:
                         pass
                         
-                found = self.finder.find_password_in_blob(resource.body_bytes)
-                if found and not any(c[0] == found for c in candidates):
-                    candidates.append((found, "Binary Body Bytes", False))
+                found_list = self.finder.find_password_in_blob(resource.body_bytes)
+                for found in found_list:
+                    if not any(c[0] == found for c in candidates):
+                        candidates.append((found, "Binary Body Bytes", False))
 
-            import base64
-            import os
-            from genai.agy_cli import password_in_image
+            for xhr in resource.xhr_responses:
+                if "raw_body" in xhr and xhr["raw_body"]:
+                    found_list = self.finder.find_password_in_blob(xhr["raw_body"])
+                    for found in found_list:
+                        if not any(c[0] == found for c in candidates):
+                            candidates.append((found, "XHR Binary Body Bytes", False))
+
+
             
             for selector, data_url in resource.canvas_data.items():
                 if "," in data_url:
@@ -359,10 +532,10 @@ class Crawler:
                         header, b64_data = data_url.split(",", 1)
                         canvas_bytes = base64.b64decode(b64_data)
                         
-                        # Check binary for ASCII
-                        found = self.finder.find_password_in_blob(canvas_bytes)
-                        if found and not any(c[0] == found for c in candidates):
-                            candidates.append((found, f"Canvas Blob: {selector}", False))
+                        found_list = self.finder.find_password_in_blob(canvas_bytes)
+                        for found in found_list:
+                            if not any(c[0] == found for c in candidates):
+                                candidates.append((found, f"Canvas Blob: {selector}", False))
                             
                         # Save and OCR with GenAI
                         if self.enable_ai and node and not node.is_reference:
@@ -376,14 +549,15 @@ class Crawler:
                         pass
 
             for f in all_findings:
-                found = self.finder.find_password_in_text(str(f))
-                if found:
+                found_list = self.finder.find_password_in_text(str(f))
+                for found in found_list:
                     is_ai = f.location == "Password Found in Image"
                     candidates.append((found, f.location, is_ai))
 
-            found = self.finder.find_password_in_text(str(resource))
-            if found and not any(c[0] == found for c in candidates):
-                candidates.append((found, "Resource Metadata", False))
+            found_list = self.finder.find_password_in_text(str(resource))
+            for found in found_list:
+                if not any(c[0] == found for c in candidates):
+                    candidates.append((found, "Resource Metadata", False))
 
             for password, location, is_ai in candidates:
                 result = self.validator.validate(
@@ -411,7 +585,7 @@ class Crawler:
                 else:
                     print(f"  Rejected '{password}' from {location}: {result.reason}")
 
-            discovered_urls = self.get_all_reachable_urls() | network_urls
+            discovered_urls = self.get_all_reachable_urls() | self._network_urls
             for discovered_url in discovered_urls:
                 if not self.is_same_site(discovered_url):
                     continue
