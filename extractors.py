@@ -678,6 +678,65 @@ class AiImageExtractor(BaseExtractor):
         return findings
 
 
+class ZeroWidthExtractor(BaseExtractor):
+    def extract(self, resource: ResourceData) -> List[Finding]:
+        findings = []
+        texts_to_scan = [resource.text_content]
+        if getattr(resource, 'inner_text', None):
+            texts_to_scan.append(resource.inner_text)
+            
+        zw_pattern = re.compile(r'[\u200B\u200C\u200D\u200E\u200F\uFEFF]{8,}')
+        
+        for text in set(texts_to_scan):
+            if not text: continue
+            for match in zw_pattern.finditer(text):
+                zw_seq = match.group(0)
+                unique_chars = list(set(zw_seq))
+                
+                if len(unique_chars) == 2:
+                    for zero_char, one_char in [(unique_chars[0], unique_chars[1]), (unique_chars[1], unique_chars[0])]:
+                        binary_str = zw_seq.replace(zero_char, '0').replace(one_char, '1')
+                        decoded = self._decode_binary_str(binary_str)
+                        if decoded:
+                            findings.append(Finding(resource.url, Category.ENCODED_OBFUSCATED, "Zero-width Steganography", decoded))
+                elif len(unique_chars) == 3:
+                    import itertools
+                    for zero, one, sep in itertools.permutations(unique_chars, 3):
+                        parts = zw_seq.split(sep)
+                        decoded = ""
+                        valid = True
+                        for p in parts:
+                            if not p: continue
+                            binary_str = p.replace(zero, '0').replace(one, '1')
+                            if not all(c in '01' for c in binary_str):
+                                valid = False
+                                break
+                            char_str = self._decode_binary_str(binary_str)
+                            if char_str:
+                                decoded += char_str
+                        if valid and decoded:
+                            findings.append(Finding(resource.url, Category.ENCODED_OBFUSCATED, "Zero-width Steganography", decoded))
+
+        return findings
+
+    def _decode_binary_str(self, binary_str: str) -> str:
+        if len(binary_str) % 8 != 0:
+            binary_str = binary_str[:len(binary_str) - (len(binary_str) % 8)]
+        if not binary_str:
+            return ""
+        try:
+            res = bytearray()
+            for i in range(0, len(binary_str), 8):
+                val = int(binary_str[i:i+8], 2)
+                res.append(val)
+            decoded = res.decode('utf-8')
+            if decoded.isprintable():
+                return decoded
+            return ""
+        except Exception:
+            return ""
+
+
 class DecodingExtractor(BaseExtractor):
     def extract(self, resource: ResourceData) -> List[Finding]:
         findings = []
@@ -691,6 +750,8 @@ class DecodingExtractor(BaseExtractor):
         findings.extend(self._scan_escapes(resource.url, texts_to_scan))
         findings.extend(self._scan_css_escapes(resource.url, texts_to_scan))
         findings.extend(self._scan_concatenated(resource.url, texts_to_scan))
+        findings.extend(self._scan_reversed(resource.url, texts_to_scan))
+        findings.extend(self._scan_base32(resource.url, texts_to_scan))
 
         return findings
 
@@ -757,6 +818,17 @@ class DecodingExtractor(BaseExtractor):
             findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} ROT13", decoded))
         return findings
 
+    def _scan_reversed(self, url: str, texts: list) -> List[Finding]:
+        findings = []
+        flag_pattern = re.compile(r'VISUALPING\{[0-9a-fA-F]{16}\}')
+        for location, text in texts:
+            if not text:
+                continue
+            reversed_text = text[::-1]
+            for match in flag_pattern.finditer(reversed_text):
+                findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} Reversed", match.group(0)))
+        return findings
+
     def _scan_hex_strings(self, url: str, texts: list) -> List[Finding]:
         hex_regex = re.compile(r'(?:[0-9a-fA-F]{2}){8,}')
         findings = []
@@ -769,6 +841,25 @@ class DecodingExtractor(BaseExtractor):
                     decoded_str = decoded_bytes.decode('utf-8', errors='ignore')
                     if len(decoded_str) > 3:
                         findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} Hex", decoded_str))
+                except Exception:
+                    pass
+        return findings
+
+    def _scan_base32(self, url: str, texts: list) -> List[Finding]:
+        import base64
+        findings = []
+        b32_regex = re.compile(r'[A-Z2-7]{16,}(?:={1,6})?', re.IGNORECASE)
+        for location, text in texts:
+            if not text:
+                continue
+            for match in b32_regex.finditer(text):
+                b32_str = match.group(0).upper()
+                pad_len = (8 - len(b32_str) % 8) % 8
+                b32_str += '=' * pad_len
+                try:
+                    decoded = base64.b32decode(b32_str).decode('utf-8', errors='strict')
+                    if len(decoded) > 3 and decoded.isprintable():
+                        findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} Base32", decoded))
                 except Exception:
                     pass
         return findings

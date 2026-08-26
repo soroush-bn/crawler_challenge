@@ -15,7 +15,7 @@ from extractors import (
     UrlExtractor, ProtocolExtractor, HtmlExtractor, JsContextExtractor,
     ImageMetadataExtractor, SteganographyExtractor, FontExtractor,
     CodeCommentExtractor, BinaryStringExtractor, AiImageExtractor,
-    DecodingExtractor
+    DecodingExtractor, ZeroWidthExtractor
 )
 from finder import Finder
 from validator import PasswordValidator
@@ -55,6 +55,7 @@ class Crawler:
             CodeCommentExtractor(),
             BinaryStringExtractor(),
             AiImageExtractor(enable_ai=self.enable_ai),
+            ZeroWidthExtractor(),
             DecodingExtractor()
         ]
         self._websocket_msgs: list[str] = []
