@@ -1,4 +1,20 @@
 
+## Key Capabilities
+- **Advanced DOM Parsing:** Extracts hidden attributes, rendered text, embedded JSON, and canvas data.
+- **Network Interception:** Captures background XHR responses, WebSockets, cookies, and headers.
+- **Deep Obfuscation Checks:** Automatically uncovers and decodes Base64, Base32, Hex, ROT13, URL encoding, reversed strings, and zero-width steganography.
+- **Media Analysis:** Mines image EXIF metadata, hidden PNG/JPEG chunks, LSB steganography, and embedded fonts.
+- **GenAI Computer Vision:** Uses the Antigravity CLI (`agy`) for AI-powered OCR to visually analyze images.
+
+## Table of Contents
+- [Key Capabilities](#key-capabilities)
+- [Setup](#setup)
+- [Environment Variables](#environment-variables)
+- [Usage](#usage)
+  - [Options](#options)
+- [Output](#output)
+- [Architecture](#architecture)
+
 ## Setup
 
 1. **Install Python dependencies:**
