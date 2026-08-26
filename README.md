@@ -1,4 +1,3 @@
-
 ## Key Capabilities
 - **Advanced DOM Parsing:** Extracts hidden attributes, rendered text, embedded JSON, and canvas data.
 - **Network Interception:** Captures background XHR responses, WebSockets, cookies, and headers.
@@ -8,12 +7,18 @@
 
 ## Table of Contents
 - [Key Capabilities](#key-capabilities)
+- [Architecture](#architecture)
 - [Setup](#setup)
 - [Environment Variables](#environment-variables)
 - [Usage](#usage)
   - [Options](#options)
 - [Output](#output)
-- [Architecture](#architecture)
+
+
+## Architecture
+This is the UML class diagram of this project.
+![Class Diagram](resources/Untitled-2026-08-25-2218.png)
+
 
 ## Setup
 
@@ -73,6 +78,4 @@ python crawler.py [OPTIONS]
 - Extracted files and metadata are saved locally into the `./data` directory in a hierarchical folder tree based on the URLs.
 - Validated passwords discovered during the crawl are logged incrementally to `PASSWORD_FOUND.txt`.
 
-## Architecture
-this is the UML class diagram of this project. 
-![Class Diagram](resources/Untitled-2026-08-25-2218.png)
+
