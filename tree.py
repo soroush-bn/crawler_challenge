@@ -1,70 +1,30 @@
-import os
 import hashlib
-from saving import Saving
-from consts import RESOURCE_DATA_FILENAME
-import mimetypes
 
 class TreeNode:
-    def __init__(self, url, parent=None, is_reference=False):
-        self.url = url
-        self.name = self._encode_url(url)
-        self.parent = parent
-        self.depth = parent.depth + 1 if parent else 0
-        self.children = []
-        self.data = None
-        self.content_hash = None
-        self.fetch_count = 0
-        self.is_reference = is_reference
+    """Represents a single visited or referenced URL in the crawl tree."""
 
-        if not self.is_reference:
-            self.folder_path = self._calculate_folder_path()
-            self.saver = Saving(self.folder_path)
+    def __init__(self, url: str, parent: 'TreeNode | None' = None, is_reference: bool = False) -> None:
+        self.url: str = url
+        self.name: str = self._encode_url(url)
+        self.parent: 'TreeNode | None' = parent
+        self.depth: int = parent.depth + 1 if parent else 0
+        self.children: list['TreeNode'] = []
+        self.content_hash: str | None = None
+        self.fetch_count: int = 0
+        self.is_reference: bool = is_reference
 
-    def _calculate_folder_path(self):
-        if self.parent:
-            return os.path.join(self.parent.folder_path, self.name)
-        return os.path.join(".", "data", self.name)
-
-    def add_child(self, child_node):
+    def add_child(self, child_node: 'TreeNode') -> None:
         self.children.append(child_node)
 
     def record_content(self, content: str) -> bool:
-        new_hash = hashlib.sha256(content.encode()).hexdigest()
+        new_hash: str = hashlib.sha256(content.encode()).hexdigest()
         self.fetch_count += 1
-        content_changed = self.content_hash is not None and self.content_hash != new_hash
+        content_changed: bool = self.content_hash is not None and self.content_hash != new_hash
         self.content_hash = new_hash
         return content_changed
 
-    def _encode_url(self, url):
+    def _encode_url(self, url: str) -> str:
         return hashlib.sha256(url.encode()).hexdigest()[:16]
-
-    def is_saved(self) -> bool:
-        if self.is_reference:
-            return True
-        file_path = os.path.join(self.folder_path, RESOURCE_DATA_FILENAME)
-        return os.path.exists(file_path)
-
-    def save(self, resource, findings):
-        if self.is_reference:
-            return
-
-        # Save resource data and binary only on first visit
-        if not self.is_saved():
-            self.saver.save_resource_data(resource)
-
-            if resource.body_bytes:
-                filename = self.url.split("/")[-1]
-                if not filename or "?" in filename or "=" in filename:
-                    
-                    # Guess extension from content_type (e.g. image/jpeg -> .jpg)
-                    content_type = resource.content_type.split(';')[0]
-                    ext = mimetypes.guess_extension(content_type) or ".bin"
-                    filename = f"downloaded_file{ext}"
-
-                self.saver.save_binary(resource.body_bytes, filename)
-
-        # Always (re-)save findings so metadata extraction results are persisted
-        self.saver.save_findings(findings)
 
 
 class Tree:

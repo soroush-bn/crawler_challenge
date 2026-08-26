@@ -1,15 +1,18 @@
 from abc import ABC, abstractmethod
-from typing import List
-from urllib.parse import urlparse, parse_qsl
+from typing import List, Optional
+from urllib.parse import urlparse, parse_qsl, unquote
 import base64
 import os
 import struct
 import io
 import zlib
+import codecs
+import html
+import re
 from html.parser import HTMLParser
 from models import ResourceData, Finding, Category
-from typing import Optional
 from genai.agy_cli import password_in_image
+from utils import MediaUtils
 
 try:
     from PIL import Image
@@ -17,6 +20,14 @@ try:
     HAS_PILLOW = True
 except ImportError:
     HAS_PILLOW = False
+
+try:
+    import fontTools.ttLib
+    HAS_FONTTOOLS = True
+except ImportError:
+    HAS_FONTTOOLS = False
+
+
 class BaseExtractor(ABC):
     @abstractmethod
     def extract(self, resource: ResourceData) -> List[Finding]:
@@ -243,104 +254,60 @@ class JsContextExtractor(BaseExtractor):
                 findings.append(Finding(resource.url, Category.JAVASCRIPT_EXECUTED, f"Computed Style [{idx}]", style))
         return findings
 
-import re
 
-class MediaExtractor(BaseExtractor):
-    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tiff'}
-    DATA_DIR = os.path.join(".", "data")
-
-    def __init__(self, enable_ai=False):
-        self.enable_ai = enable_ai
-
+class ImageMetadataExtractor(BaseExtractor):
     def extract(self, resource: ResourceData) -> List[Finding]:
         findings = []
-        if not resource.body_bytes:
-            return findings
-
-        is_image = self._is_image(resource)
-        content_type = resource.content_type.lower()
-
-        if is_image:
-            findings.extend(self._extract_image(resource))
-            findings.extend(self._agi_image_extract(resource))
-            findings.extend(self._extract_lsb_steganography(resource.url, resource.body_bytes))
-        elif "javascript" in content_type or "css" in content_type:
-            findings.extend(self._extract_code(resource))
-        elif self._is_font(content_type, resource.url):
-            findings.extend(self._extract_font_metadata(resource))
-            
-        # Post-process all extracted media metadata strings:
-        # If a bare 16-character hex string is found, wrap it in VISUALPING{...}
-        # so the downstream finder regex will detect it.
-        hex_pattern = re.compile(r'(?<!VISUALPING\{)\b([a-fA-F0-9]{16})\b(?!\})')
-        for f in findings:
-            if isinstance(f.content, str):
-                f.content = hex_pattern.sub(r'VISUALPING{\1}', f.content)
-                
-        return findings
-
-    def _is_font(self, content_type: str, url: str) -> bool:
-        font_types = {'font/', 'application/font', 'application/x-font',
-                      'application/vnd.ms-fontobject'}
-        if any(content_type.startswith(ft) for ft in font_types):
-            return True
-        font_extensions = {'.woff', '.woff2', '.ttf', '.otf', '.eot'}
-        url_path = url.split("?")[0]
-        ext = os.path.splitext(url_path)[1].lower()
-        return ext in font_extensions
-
-    def _is_image(self, resource: ResourceData) -> bool:
-        if resource.content_type.lower().startswith("image/"):
-            return True
-        url_path = resource.url.split("?")[0]
-        ext = os.path.splitext(url_path)[1].lower()
-        return ext in self.IMAGE_EXTENSIONS
-
-    def _agi_image_extract(self, resource: ResourceData) -> List[Finding]:
-        findings = []
-        if not self.enable_ai:
+        if not resource.body_bytes or not MediaUtils.is_image(resource):
             return findings
             
-        filename = resource.url.split("/")[-1].split("?")[0]
-        if not filename:
-            return findings
-        
-        for root, dirs, files in os.walk(self.DATA_DIR):
-            if filename in files:
-                result = password_in_image(root, filename)
-                if result:
-                    findings.append(Finding(resource.url, Category.LINKED_RESOURCES, "Password Found in Image", result))
-                break
-        return findings
-
-    def _extract_image(self, resource: ResourceData) -> List[Finding]:
-        findings = []
         data = resource.body_bytes
         url = resource.url
 
-        # 1. EXIF metadata via Pillow (JPEG, TIFF, WebP, PNG)
         findings.extend(self._extract_exif(url, data))
-
-        # 2. PNG text chunks (tEXt, zTXt, iTXt) — parsed manually from bytes
+        
         if data[:4] == b'\x89PNG':
             findings.extend(self._extract_png_text_chunks(url, data))
-
-        # 3. JPEG COM (comment) markers
+            
         if data[:2] == b'\xff\xd8':
             findings.extend(self._extract_jpeg_comments(url, data))
-
-        # 4. XMP embedded XML/RDF
+            
         findings.extend(self._extract_xmp(url, data))
-
-        # 5. Trailing data after end-of-image (hidden appended content)
-        findings.extend(self._extract_trailing_data(url, data))
-
-        # 6. Fallback: raw ASCII string scan for anything the above missed
-        findings.extend(self._extract_ascii_strings(url, data))
 
         return findings
 
-    # ── EXIF via Pillow ──────────────────────────────────────────────
+    @staticmethod
+    def _safe_str(value) -> Optional[str]:
+        """Convert an EXIF value to a string, properly handling UTF-16 UserComments."""
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            # EXIF UserComment prefix handling
+            if value.startswith(b'UNICODE\x00'):
+                text_bytes = value[8:]
+                for enc in ('utf-16', 'utf-16-be', 'utf-16-le', 'utf-8'):
+                    try:
+                        s = text_bytes.decode(enc)
+                        return s.strip() if s.strip() else None
+                    except UnicodeDecodeError:
+                        continue
+            elif value.startswith(b'ASCII\x00\x00\x00'):
+                try:
+                    s = value[8:].decode('ascii', errors='ignore')
+                    return s.strip() if s.strip() else None
+                except Exception:
+                    pass
+            
+            # Fallback for raw bytes
+            for enc in ('utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'latin-1'):
+                try:
+                    s = value.decode(enc)
+                    return s.strip() if s.strip() else None
+                except UnicodeDecodeError:
+                    continue
+            return None
+        s = str(value).strip()
+        return s if s else None
 
     def _extract_exif(self, url: str, data: bytes) -> List[Finding]:
         if not HAS_PILLOW:
@@ -396,8 +363,6 @@ class MediaExtractor(BaseExtractor):
         except Exception:
             pass
         return findings
-
-    # ── PNG tEXt / zTXt / iTXt chunks ────────────────────────────────
 
     def _extract_png_text_chunks(self, url: str, data: bytes) -> List[Finding]:
         """Parse PNG chunks directly from bytes to catch tEXt, zTXt, iTXt."""
@@ -500,7 +465,6 @@ class MediaExtractor(BaseExtractor):
 
         return findings
 
-    # ── XMP (embedded XML/RDF) ───────────────────────────────────────
 
     def _extract_xmp(self, url: str, data: bytes) -> List[Finding]:
         """Extract XMP XML embedded in image files (JPEG, PNG, TIFF, etc.)."""
@@ -523,7 +487,6 @@ class MediaExtractor(BaseExtractor):
                 continue
 
             # Extract key fields from XMP via simple regex (avoids lxml dependency)
-            import re as _re
             # dc:description, dc:creator, dc:title, xmp:Label, etc.
             tag_patterns = [
                 (r'<dc:description[^>]*>\s*<rdf:Alt[^>]*>\s*<rdf:li[^>]*>(.+?)</rdf:li>', 'XMP dc:description'),
@@ -536,7 +499,7 @@ class MediaExtractor(BaseExtractor):
                 (r'<photoshop:Instructions>(.+?)</photoshop:Instructions>', 'XMP photoshop:Instructions'),
             ]
             for pattern, label in tag_patterns:
-                for match in _re.finditer(pattern, xmp_text, _re.DOTALL):
+                for match in re.finditer(pattern, xmp_text, re.DOTALL):
                     val = match.group(1).strip()
                     if val:
                         findings.append(Finding(url, Category.LINKED_RESOURCES, label, val))
@@ -551,25 +514,27 @@ class MediaExtractor(BaseExtractor):
 
         return findings
 
-    # ── Trailing data after end-of-image ─────────────────────────────
+
+class SteganographyExtractor(BaseExtractor):
+    def extract(self, resource: ResourceData) -> List[Finding]:
+        findings = []
+        if not resource.body_bytes or not MediaUtils.is_image(resource):
+            return findings
+        findings.extend(self._extract_trailing_data(resource.url, resource.body_bytes))
+        findings.extend(self._extract_lsb_steganography(resource.url, resource.body_bytes))
+        return findings
 
     def _extract_trailing_data(self, url: str, data: bytes) -> List[Finding]:
-        """Check for data appended after the logical end of the image."""
         findings = []
-
-        # PNG: data after IEND chunk
         iend = data.find(b'IEND')
         if iend != -1:
-            # IEND chunk is: 4-byte length (0) + 'IEND' + 4-byte CRC = 12 bytes total
-            end_pos = iend + 8  # skip 'IEND' + CRC
+            end_pos = iend + 8
             if end_pos < len(data):
                 trailing = data[end_pos:]
-                if len(trailing) > 4:  # ignore trivial padding
+                if len(trailing) > 4:
                     printable = trailing.decode('latin-1', errors='replace')
                     findings.append(Finding(url, Category.LINKED_RESOURCES,
                                             f"PNG Trailing Data ({len(trailing)} bytes)", printable[:500]))
-
-        # JPEG: data after EOI marker (0xFFD9)
         elif data[:2] == b'\xff\xd8':
             eoi = data.rfind(b'\xff\xd9')
             if eoi != -1:
@@ -580,72 +545,9 @@ class MediaExtractor(BaseExtractor):
                         printable = trailing.decode('latin-1', errors='replace')
                         findings.append(Finding(url, Category.LINKED_RESOURCES,
                                                 f"JPEG Trailing Data ({len(trailing)} bytes)", printable[:500]))
-
-        return findings
-
-    # ── Fallback ASCII string scan ───────────────────────────────────
-
-    def _extract_ascii_strings(self, url: str, data: bytes) -> List[Finding]:
-        """Raw byte ASCII extraction — catches anything the structured parsers missed."""
-        findings = []
-        strings = re.findall(b'[ -~]{8,}', data)
-        for idx, b_str in enumerate(strings):
-            s = b_str.decode('ascii', errors='ignore')
-            findings.append(Finding(url, Category.LINKED_RESOURCES, f"Binary String [{idx}]", s))
-        return findings
-
-    # ── Helpers ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _safe_str(value) -> Optional[str]:
-        """Convert an EXIF value to a string, returning None for empty/uninteresting data."""
-        if value is None:
-            return None
-        if isinstance(value, bytes):
-            # Try UTF-8 first, fall back to latin-1
-            for enc in ('utf-8', 'latin-1'):
-                try:
-                    s = value.decode(enc)
-                    return s.strip() if s.strip() else None
-                except UnicodeDecodeError:
-                    continue
-            return None
-        s = str(value).strip()
-        return s if s else None
-
-    def _extract_font_metadata(self, resource: ResourceData) -> List[Finding]:
-        """Extract name table strings from font files using fontTools or UTF-16 decoding."""
-        findings = []
-        data = resource.body_bytes
-        url = resource.url
-
-        try:
-            import fontTools.ttLib
-            import io
-            font = fontTools.ttLib.TTFont(io.BytesIO(data))
-            if 'name' in font:
-                for record in font['name'].names:
-                    s = record.toUnicode()
-                    if s:
-                        findings.append(Finding(url, Category.LINKED_RESOURCES, f"Font Name Table: {record.nameID}", s))
-        except Exception:
-            pass
-
-        for encoding in ('utf-16-be', 'utf-16-le'):
-            try:
-                decoded = data.decode(encoding, errors='ignore')
-                strings = re.findall(r'[ -~]{4,}', decoded)
-                for idx, s in enumerate(strings):
-                    findings.append(Finding(
-                        url, Category.LINKED_RESOURCES,
-                        f"Font String ({encoding}) [{idx}]", s))
-            except Exception:
-                pass
-
         return findings
 
     def _extract_lsb_steganography(self, url: str, data: bytes) -> List[Finding]:
-        """Decode least-significant bits of pixel channels into ASCII."""
         if not HAS_PILLOW:
             return []
         findings = []
@@ -680,6 +582,69 @@ class MediaExtractor(BaseExtractor):
             pass
         return findings
 
+class BinaryStringExtractor(BaseExtractor):
+    def extract(self, resource: ResourceData) -> List[Finding]:
+        findings = []
+        if not resource.body_bytes or not MediaUtils.is_image(resource):
+            return findings
+        findings.extend(self._extract_ascii_strings(resource.url, resource.body_bytes))
+        return findings
+
+    def _extract_ascii_strings(self, url: str, data: bytes) -> List[Finding]:
+        findings = []
+        strings = re.findall(b'[ -~]{8,}', data)
+        for idx, b_str in enumerate(strings):
+            s = b_str.decode('ascii', errors='ignore')
+            findings.append(Finding(url, Category.LINKED_RESOURCES, f"Binary String [{idx}]", s))
+        return findings
+
+class FontExtractor(BaseExtractor):
+    def _is_font(self, content_type: str, url: str) -> bool:
+        font_types = {'font/', 'application/font', 'application/x-font', 'application/vnd.ms-fontobject'}
+        if any(content_type.startswith(ft) for ft in font_types):
+            return True
+        ext = os.path.splitext(url.split("?")[0])[1].lower()
+        return ext in {'.woff', '.woff2', '.ttf', '.otf', '.eot'}
+
+    def extract(self, resource: ResourceData) -> List[Finding]:
+        if not resource.body_bytes or not self._is_font(resource.content_type.lower(), resource.url):
+            return []
+        findings = self._extract_font_metadata(resource)
+        return findings
+
+    def _extract_font_metadata(self, resource: ResourceData) -> List[Finding]:
+        findings = []
+        data = resource.body_bytes
+        url = resource.url
+        try:
+            if HAS_FONTTOOLS:
+                font = fontTools.ttLib.TTFont(io.BytesIO(data))
+                if 'name' in font:
+                    for record in font['name'].names:
+                        s = record.toUnicode()
+                        if s:
+                            findings.append(Finding(url, Category.LINKED_RESOURCES, f"Font Name Table: {record.nameID}", s))
+        except Exception:
+            pass
+
+        for encoding in ('utf-16-be', 'utf-16-le'):
+            try:
+                decoded = data.decode(encoding, errors='ignore')
+                strings = re.findall(r'[ -~]{4,}', decoded)
+                for idx, s in enumerate(strings):
+                    findings.append(Finding(url, Category.LINKED_RESOURCES, f"Font String ({encoding}) [{idx}]", s))
+            except Exception:
+                pass
+        return findings
+
+class CodeCommentExtractor(BaseExtractor):
+    def extract(self, resource: ResourceData) -> List[Finding]:
+        content_type = resource.content_type.lower()
+        if "javascript" not in content_type and "css" not in content_type:
+            return []
+        findings = self._extract_code(resource)
+        return findings
+
     def _extract_code(self, resource: ResourceData) -> List[Finding]:
         findings = []
         comments = re.findall(r'/\*[\s\S]*?\*/|//.*', resource.text_content)
@@ -687,9 +652,33 @@ class MediaExtractor(BaseExtractor):
             findings.append(Finding(resource.url, Category.LINKED_RESOURCES, f"Code Comment [{idx}]", c))
         return findings
 
-class DecodingExtractor(BaseExtractor):
-    FLAG_SEARCH_PATTERN = re.compile(r'VISUALPING\{[0-9a-fA-F]{16}\}')
+class AiImageExtractor(BaseExtractor):
+    def __init__(self, enable_ai=False):
+        self.enable_ai = enable_ai
 
+    def extract(self, resource: ResourceData) -> List[Finding]:
+        if not resource.body_bytes or not MediaUtils.is_image(resource):
+            return []
+        findings = self._agi_image_extract(resource)
+        return findings
+
+    def _agi_image_extract(self, resource: ResourceData) -> List[Finding]:
+        findings = []
+        if not self.enable_ai:
+            return findings
+        filename = resource.url.split("/")[-1].split("?")[0]
+        if not filename:
+            return findings
+        for root, dirs, files in os.walk(MediaUtils.DATA_DIR):
+            if filename in files:
+                result = password_in_image(root, filename)
+                if result:
+                    findings.append(Finding(resource.url, Category.LINKED_RESOURCES, "Password Found in Image", result))
+                break
+        return findings
+
+
+class DecodingExtractor(BaseExtractor):
     def extract(self, resource: ResourceData) -> List[Finding]:
         findings = []
         texts_to_scan = self._collect_texts(resource)
@@ -697,7 +686,6 @@ class DecodingExtractor(BaseExtractor):
         findings.extend(self._scan_base64(resource.url, texts_to_scan))
         findings.extend(self._scan_rot13(resource.url, texts_to_scan))
         findings.extend(self._scan_hex_strings(resource.url, texts_to_scan))
-        findings.extend(self._scan_reversed(resource.url, texts_to_scan))
         findings.extend(self._scan_url_encoded(resource.url, texts_to_scan))
         findings.extend(self._scan_char_arrays(resource.url, texts_to_scan))
         findings.extend(self._scan_escapes(resource.url, texts_to_scan))
@@ -760,21 +748,16 @@ class DecodingExtractor(BaseExtractor):
         return findings
 
     def _scan_rot13(self, url: str, texts: list) -> List[Finding]:
-        """Apply ROT13 to all text and search for the flag pattern."""
         import codecs
         findings = []
         for location, text in texts:
             if not text:
                 continue
             decoded = codecs.decode(text, 'rot_13')
-            for match in self.FLAG_SEARCH_PATTERN.finditer(decoded):
-                findings.append(Finding(
-                    url, Category.ENCODED_OBFUSCATED,
-                    f"{location} ROT13", match.group(0)))
+            findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} ROT13", decoded))
         return findings
 
     def _scan_hex_strings(self, url: str, texts: list) -> List[Finding]:
-        """Find long hex sequences in text, decode them, and search."""
         hex_regex = re.compile(r'(?:[0-9a-fA-F]{2}){8,}')
         findings = []
         for location, text in texts:
@@ -785,29 +768,12 @@ class DecodingExtractor(BaseExtractor):
                     decoded_bytes = bytes.fromhex(match.group(0))
                     decoded_str = decoded_bytes.decode('utf-8', errors='ignore')
                     if len(decoded_str) > 3:
-                        for flag in self.FLAG_SEARCH_PATTERN.finditer(decoded_str):
-                            findings.append(Finding(
-                                url, Category.ENCODED_OBFUSCATED,
-                                f"{location} Hex", flag.group(0)))
+                        findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} Hex", decoded_str))
                 except Exception:
                     pass
         return findings
 
-    def _scan_reversed(self, url: str, texts: list) -> List[Finding]:
-        """Reverse all text and search for the flag pattern."""
-        findings = []
-        for location, text in texts:
-            if not text:
-                continue
-            reversed_text = text[::-1]
-            for match in self.FLAG_SEARCH_PATTERN.finditer(reversed_text):
-                findings.append(Finding(
-                    url, Category.ENCODED_OBFUSCATED,
-                    f"{location} Reversed", match.group(0)))
-        return findings
-
     def _scan_url_encoded(self, url: str, texts: list) -> List[Finding]:
-        """URL-decode text and search for the flag pattern."""
         from urllib.parse import unquote
         findings = []
         for location, text in texts:
@@ -815,10 +781,7 @@ class DecodingExtractor(BaseExtractor):
                 continue
             decoded = unquote(text)
             if decoded != text:
-                for match in self.FLAG_SEARCH_PATTERN.finditer(decoded):
-                    findings.append(Finding(
-                        url, Category.ENCODED_OBFUSCATED,
-                        f"{location} URL-decoded", match.group(0)))
+                findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} URL-decoded", decoded))
         return findings
 
     def _try_base64_decode(self, text: str) -> Optional[str]:
@@ -833,110 +796,71 @@ class DecodingExtractor(BaseExtractor):
             return None
 
     def _scan_char_arrays(self, url: str, texts: list) -> List[Finding]:
-        """Detect arrays of character codes and convert them back to ASCII strings."""
         findings = []
-        # Matches brackets containing at least 10 comma-separated integers (e.g. [86, 73, 83, ...])
         array_regex = re.compile(r'\[\s*(?:\d{2,3}\s*,\s*){10,}\d{2,3}\s*\]')
-        
         for location, text in texts:
             if not text:
                 continue
             for match in array_regex.finditer(text):
                 try:
-                    # Remove brackets and split by comma
                     nums_str = match.group(0)[1:-1].split(',')
                     nums = [int(x.strip()) for x in nums_str]
-                    
-                    # Convert valid ASCII ranges
                     decoded = "".join(chr(n) for n in nums if 32 <= n <= 126)
-                    
-                    for flag in self.FLAG_SEARCH_PATTERN.finditer(decoded):
-                        findings.append(Finding(
-                            url, Category.ENCODED_OBFUSCATED,
-                            f"{location} Char Array", flag.group(0)))
+                    findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} Char Array", decoded))
                 except Exception:
                     pass
         return findings
 
     def _scan_escapes(self, url: str, texts: list) -> List[Finding]:
-        """Decode Unicode escapes (\u0056) and HTML entities (&#86;) and search for the flag."""
         findings = []
         import html
         import codecs
-        
         for location, text in texts:
             if not text:
                 continue
-            
-            # 1. HTML Unescape
             try:
                 unescaped = html.unescape(text)
                 if unescaped != text:
-                    for match in self.FLAG_SEARCH_PATTERN.finditer(unescaped):
-                        findings.append(Finding(
-                            url, Category.ENCODED_OBFUSCATED,
-                            f"{location} HTML Entities", match.group(0)))
+                    findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} HTML Entities", unescaped))
             except Exception:
                 pass
                 
-            # 2. Unicode/Hex escapes (\u0056, \x56)
             try:
-                # Use unicode_escape codec on raw bytes to unescape
                 escaped_bytes = text.encode('utf-8', errors='ignore')
                 decoded_escapes = codecs.decode(escaped_bytes, 'unicode_escape').decode('utf-8', errors='ignore')
                 if decoded_escapes != text:
-                    for match in self.FLAG_SEARCH_PATTERN.finditer(decoded_escapes):
-                        findings.append(Finding(
-                            url, Category.ENCODED_OBFUSCATED,
-                            f"{location} String Escapes", match.group(0)))
+                    findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} String Escapes", decoded_escapes))
             except Exception:
                 pass
                 
         return findings
 
     def _scan_css_escapes(self, url: str, texts: list) -> List[Finding]:
-        """Decode CSS escapes (e.g. \0056) and search for the flag."""
         findings = []
-        # CSS escape matches backslash followed by 1-6 hex digits and an optional space
         css_escape_regex = re.compile(r'\\([0-9a-fA-F]{1,6})\s?')
         
         for location, text in texts:
             if not text or '\\' not in text:
                 continue
-                
             try:
                 def replace_escape(match):
                     return chr(int(match.group(1), 16))
                 
                 decoded = css_escape_regex.sub(replace_escape, text)
                 if decoded != text:
-                    for match in self.FLAG_SEARCH_PATTERN.finditer(decoded):
-                        findings.append(Finding(
-                            url, Category.ENCODED_OBFUSCATED,
-                            f"{location} CSS Escapes", match.group(0)))
+                    findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} CSS Escapes", decoded))
             except Exception:
                 pass
         return findings
 
     def _scan_concatenated(self, url: str, texts: list) -> List[Finding]:
-        """Strip JS string concatenation (e.g. 'VIS' + 'UAL' + 'PING') before scanning."""
         findings = []
-        # Matches closing quote, optional spaces, plus, optional spaces, opening quote
         concat_regex = re.compile(r'[\'"]\s*\+\s*[\'"]')
         
         for location, text in texts:
-            if not text:
+            if not text or '+' not in text:
                 continue
-            
-            # Fast fail if no + symbol exists
-            if '+' not in text:
-                continue
-                
-            de_concatenated = concat_regex.sub('', text)
-            if de_concatenated != text:
-                for match in self.FLAG_SEARCH_PATTERN.finditer(de_concatenated):
-                    findings.append(Finding(
-                        url, Category.ENCODED_OBFUSCATED,
-                        f"{location} Concatenated String", match.group(0)))
-                        
+            decoded = concat_regex.sub('', text)
+            if decoded != text:
+                findings.append(Finding(url, Category.ENCODED_OBFUSCATED, f"{location} Concatenated String", decoded))
         return findings

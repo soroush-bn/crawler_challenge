@@ -1,45 +1,60 @@
 import os
 import queue
 import json
+import base64
+from urllib.parse import urlparse
+from collections import deque
+from typing import Any
+
 from playwright.sync_api import sync_playwright
 from consts import BASE_URL, USERNAME, PASSWORD, PAGE_LIMIT
 from tree import Tree, TreeNode
 from models import ResourceData
-from extractors import UrlExtractor, ProtocolExtractor, HtmlExtractor, JsContextExtractor, MediaExtractor, DecodingExtractor
+from saving import StorageManager
+from extractors import (
+    UrlExtractor, ProtocolExtractor, HtmlExtractor, JsContextExtractor,
+    ImageMetadataExtractor, SteganographyExtractor, FontExtractor,
+    CodeCommentExtractor, BinaryStringExtractor, AiImageExtractor,
+    DecodingExtractor
+)
 from finder import Finder
 from validator import PasswordValidator
-from urllib.parse import urlparse
-from collections import deque
-import base64
-import os
 from genai.agy_cli import password_in_image
-from typing import Any
 
 class Crawler:
     def is_same_site(self, url: str) -> bool:
         return urlparse(url).netloc in ("", urlparse(self.base_url).netloc)
 
-    def __init__(self, enable_interaction=False, enable_ai=False):
-        self.enable_interaction = enable_interaction
-        self.enable_ai = enable_ai
-        self.base_url = BASE_URL
-        self.username = USERNAME
-        self.password = PASSWORD
-        self.playwright =  sync_playwright().start()
+    def __init__(self, enable_interaction: bool = False, enable_ai: bool = False) -> None:
+        self.enable_interaction: bool = enable_interaction
+        self.enable_ai: bool = enable_ai
+        self.base_url: str = BASE_URL
+        self.username: str = USERNAME
+        self.password: str = PASSWORD
+        
+        self.playwright = sync_playwright().start()
         self.browser = self.playwright.chromium.launch(headless=False)
         self.context = self.browser.new_context(
             http_credentials={"username": self.username, "password": self.password}
         )
         self.page = self.context.new_page()
+        
         self.tree = Tree(self.base_url)
         self.finder = Finder(self.base_url)
         self.validator = PasswordValidator()
+        self.storage = StorageManager()
+        
         self.extractors = [
             UrlExtractor(),
             ProtocolExtractor(),
             HtmlExtractor(),
             JsContextExtractor(),
-            MediaExtractor(enable_ai=self.enable_ai),
+            ImageMetadataExtractor(),
+            SteganographyExtractor(),
+            FontExtractor(),
+            CodeCommentExtractor(),
+            BinaryStringExtractor(),
+            AiImageExtractor(enable_ai=self.enable_ai),
             DecodingExtractor()
         ]
         self._websocket_msgs: list[str] = []
@@ -482,7 +497,7 @@ class Crawler:
                 except Exception as e:
                     print(f"Extractor {ext.__class__.__name__} failed on {url}: {e}")
 
-            node.save(resource, all_findings)
+            self.storage.save_node(node, resource, all_findings)
 
             candidates = []
             found_list = self.finder.find_password_in_text(content)
@@ -540,9 +555,10 @@ class Crawler:
                         # Save and OCR with GenAI
                         if self.enable_ai and node and not node.is_reference:
                             canvas_filename = f"canvas_{hash(selector)}.png"
-                            with open(os.path.join(node.folder_path, canvas_filename), "wb") as cf:
+                            resource_dir = self.storage.get_folder_path(node)
+                            with open(os.path.join(resource_dir, canvas_filename), "wb") as cf:
                                 cf.write(canvas_bytes)
-                            found_ai = password_in_image(node.folder_path, canvas_filename)
+                            found_ai = password_in_image(resource_dir, canvas_filename)
                             if found_ai and not any(c[0] == found_ai for c in candidates):
                                 candidates.append((found_ai, f"Canvas Image OCR: {selector}", True))
                     except Exception:
@@ -569,7 +585,7 @@ class Crawler:
 
                 if result.is_valid:
                     password_count += 1
-                    resource_dir = os.path.abspath(node.folder_path)
+                    resource_dir = os.path.abspath(self.storage.get_folder_path(node))
                     print("\n" + "="*50)
                     print(f"#{password_count} VALIDATED PASSWORD: {result.password}")
                     print(f"   Confidence: {result.confidence}")
